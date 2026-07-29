@@ -1,0 +1,89 @@
+syntax = "proto3";
+
+package sag.tunnel.v1;
+
+service TunnelService {
+  rpc CreateTunnel(stream TunnelMessage) returns (stream TunnelMessage);
+  rpc Forward(ForwardRequest) returns (ForwardResponse);
+}
+
+message TunnelMessage {
+  oneof payload {
+    ConnectorRegister register = 1;
+    ConnectorHeartbeat heartbeat = 2;
+    ForwardRequest request = 3;
+    ForwardResponse response = 4;
+    CancelRequest cancel = 5;
+    ConnectorRegisterAck register_ack = 6;
+    ForwardAccepted accepted = 7;
+  }
+}
+
+message ConnectorRegister {
+  string connector_id = 1;
+  string app_id = 2;
+  string external_host = 3;
+  string endpoint = 4;
+  string stream_epoch = 5;
+}
+
+message ConnectorHeartbeat {
+  string connector_id = 1;
+  string endpoint = 2;
+  int64 unix_ts = 3;
+  string stream_epoch = 4;
+}
+
+message ForwardRequest {
+  string request_id = 1;
+  string app_id = 2;
+  string method = 3;
+  string path = 4;
+  map<string, string> headers = 5;
+  bytes body = 6;
+  // Unique transport attempt. A logical request may never route responses by
+  // request_id alone because a late response can otherwise complete a retry.
+  string attempt_id = 7;
+  // Absolute Unix epoch deadline shared by every queue and network hop.
+  int64 deadline_unix_ms = 8;
+  // Required for mutating methods by the bridge and propagated downstream.
+  string idempotency_key = 9;
+  string stream_epoch = 10;
+}
+
+message ForwardResponse {
+  string request_id = 1;
+  uint32 status_code = 2;
+  map<string, string> headers = 3;
+  bytes body = 4;
+  string attempt_id = 5;
+  // Ordered, append-preserving response headers. New readers MUST prefer this
+  // field when non-empty; `headers` remains for coordinated upgrade compatibility.
+  repeated HttpHeader header_values = 6;
+  // Field 6 was allocated to header_values before stream epochs were accepted.
+  string stream_epoch = 7;
+}
+
+message HttpHeader {
+  string name = 1;
+  bytes value = 2;
+}
+
+message CancelRequest {
+  string request_id = 1;
+  string attempt_id = 2;
+  string reason = 3;
+  string stream_epoch = 4;
+}
+
+message ConnectorRegisterAck {
+  string connector_id = 1;
+  string endpoint = 2;
+  string stream_epoch = 3;
+}
+
+message ForwardAccepted {
+  string request_id = 1;
+  string attempt_id = 2;
+  string stream_epoch = 3;
+}

@@ -1,0 +1,10 @@
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+          gateway: 172.20.0.1
+
+services:
+  redis:
+    ports: !override ["6380:6379"]

@@ -1,0 +1,57 @@
+[
+    {
+        "id":  "u-boss-001",
+        "roles":  [
+                      "boss"
+                  ],
+        "dept":  "管理层",
+        "username":  "boss",
+        "password":  "Boss@123",
+        "title":  "总经理",
+        "display_name":  "赵总"
+    },
+    {
+        "id":  "u-tech-001",
+        "roles":  [
+                      "tech"
+                  ],
+        "dept":  "研发",
+        "username":  "alice",
+        "password":  "Tech@123",
+        "title":  "后端工程师",
+        "display_name":  "张晨"
+    },
+    {
+        "id":  "u-tech-002",
+        "roles":  [
+                      "tech"
+                  ],
+        "dept":  "研发",
+        "username":  "bob",
+        "password":  "Tech@123",
+        "title":  "前端工程师",
+        "display_name":  "李然"
+    },
+    {
+        "id":  "u-fin-001",
+        "roles":  [
+                      "finance"
+                  ],
+        "dept":  "财务",
+        "username":  "cathy",
+        "password":  "Fin@123",
+        "title":  "财务主管",
+        "display_name":  "王敏"
+    },
+    {
+        "id":  "u-vendor-001",
+        "roles":  [
+                      "vendor"
+                  ],
+        "dept":  "外协",
+        "username":  "vendor_a",
+        "password":  "Vendor@123",
+        "title":  "外包实施顾问",
+        "display_name":  "陈外协"
+    }
+]

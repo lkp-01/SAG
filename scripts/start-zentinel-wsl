@@ -1,0 +1,2 @@
+#!/usr/bin/env bash
+exec bash "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/start-zentinel-wsl.sh" "$@"

@@ -1,0 +1,64 @@
+global:
+  scrape_interval: 10s
+  evaluation_interval: 10s
+
+rule_files:
+  - /etc/prometheus/alerts/*.yml
+
+scrape_configs:
+  - job_name: 'control-plane-admin'
+    static_configs:
+      - targets: ['control-plane-admin:8090']
+    metrics_path: /metrics
+
+  - job_name: 'sag-auth'
+    static_configs:
+      - targets: ['sag-auth:8080', 'sag-auth-2:8080']
+    metrics_path: /metrics
+
+  - job_name: 'sag-policy'
+    static_configs:
+      - targets: ['sag-policy:8081', 'sag-policy-2:8081']
+    metrics_path: /metrics
+
+  - job_name: 'http-tunnel-bridge'
+    static_configs:
+      - targets: ['http-tunnel-bridge:9000', 'http-tunnel-bridge-2:9000']
+    metrics_path: /metrics
+
+  - job_name: 'stealth-tunnel-agent'
+    static_configs:
+      - targets: ['stealth-tunnel-agent:9104', 'stealth-tunnel-agent-2:9104']
+
+  - job_name: 'sag-connector'
+    static_configs:
+      - targets: ['192.168.9.26:19090']
+    metrics_path: /connector/metrics
+
+  - job_name: 'zentinel-proxy'
+    static_configs:
+      - targets: ['zentinel:9090']
+    metrics_path: /metrics
+
+  - job_name: 'apisix'
+    static_configs:
+      - targets: ['192.168.9.26:19090']
+    metrics_path: /apisix/metrics
+
+  - job_name: 'grafana'
+    static_configs:
+      - targets: ['grafana:3000']
+    metrics_path: /metrics
+
+  - job_name: 'mock-workload'
+    static_configs:
+      - targets: ['192.168.9.26:19090']
+    metrics_path: /mock/metrics
+
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['prometheus:9090']
+
+  - job_name: 'node'
+    static_configs:
+      - targets: ['node-exporter:9100']

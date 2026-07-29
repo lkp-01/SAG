@@ -1,0 +1,312 @@
+{
+    "metrics": {
+        "sag_dataplane_bridge_status_total{status:202}": {
+            "count": 0,
+            "rate": 0,
+            "thresholds": {
+                "rate>=0": false
+            }
+        },
+        "sag_api_latency_ms{api:dataplane_get}": {
+            "max": 30119.481,
+            "p(90)": 30018.0743,
+            "p(95)": 30021.22245,
+            "avg": 13874.937229916846,
+            "min": 4.5799,
+            "med": 2832.8755499999997,
+            "thresholds": {
+                "p(95)<2500": true,
+                "p(99)<5000": true
+            }
+        },
+        "checks": {
+            "passes": 34147,
+            "fails": 25799,
+            "value": 0.5696293330664265
+        },
+        "sag_api_success_rate{api:auth_verify}": {
+            "passes": 0,
+            "fails": 0,
+            "thresholds": {
+                "rate>0.98": false
+            },
+            "value": 0
+        },
+        "sag_api_failure_http_status_total{api:dataplane_get,status:404}": {
+            "passes": 0,
+            "fails": 0,
+            "thresholds": {
+                "rate>=0": false
+            },
+            "value": 0
+        },
+        "sag_api_system_failure_total": {
+            "count": 25799,
+            "rate": 198.45865862365727
+        },
+        "sag_api_success_rate{api:policy_evaluate}": {
+            "passes": 0,
+            "fails": 0,
+            "thresholds": {
+                "rate>0.98": false
+            },
+            "value": 0
+        },
+        "iterations": {
+            "count": 59946,
+            "rate": 461.1342590741408
+        },
+        "sag_fullchain_dataplane_skipped_total": {
+            "count": 0,
+            "rate": 0,
+            "thresholds": {
+                "count>=0": false
+            }
+        },
+        "sag_api_success_rate": {
+            "passes": 34147,
+            "fails": 25799,
+            "value": 0.5696293330664265
+        },
+        "http_req_receiving": {
+            "avg": 0.07373762052513934,
+            "min": 0,
+            "med": 0,
+            "max": 9.6585,
+            "p(90)": 0,
+            "p(95)": 0.52615
+        },
+        "data_sent": {
+            "count": 22835961,
+            "rate": 175665.49821474287
+        },
+        "sag_dataplane_failure_cause_total": {
+            "count": 25799,
+            "rate": 198.45865862365727
+        },
+        "sag_api_failure_http_status_total{api:dataplane_get,status:403}": {
+            "fails": 0,
+            "passes": 0,
+            "thresholds": {
+                "rate>=0": false
+            },
+            "value": 0
+        },
+        "sag_dataplane_bridge_status_total{status:200}": {
+            "count": 34147,
+            "rate": 262.67560045048356,
+            "thresholds": {
+                "rate>=0": false
+            }
+        },
+        "http_req_blocked": {
+            "p(90)": 5.17655,
+            "p(95)": 6.717700000000001,
+            "avg": 1.2229637356954617,
+            "min": 0,
+            "med": 0,
+            "max": 81.1268
+        },
+        "sag_api_errors_total": {
+            "count": 25799,
+            "rate": 198.45865862365727
+        },
+        "http_req_duration": {
+            "avg": 13874.937229916846,
+            "min": 4.5799,
+            "med": 2832.8755499999997,
+            "max": 30119.481,
+            "p(90)": 30018.0743,
+            "p(95)": 30021.22245,
+            "thresholds": {
+                "p(99)<5000": true,
+                "p(95)<2500": true
+            }
+        },
+        "sag_api_success_rate{api:dataplane_get}": {
+            "passes": 34147,
+            "fails": 25799,
+            "thresholds": {
+                "rate>0.98": true
+            },
+            "value": 0.5696293330664265
+        },
+        "http_req_sending": {
+            "avg": 0.05678522837220173,
+            "min": 0,
+            "med": 0,
+            "max": 2.1446,
+            "p(90)": 0.31265,
+            "p(95)": 0.5329
+        },
+        "http_reqs": {
+            "count": 59946,
+            "rate": 461.1342590741408
+        },
+        "sag_dataplane_bridge_status_total": {
+            "count": 59946,
+            "rate": 461.1342590741408
+        },
+        "sag_chain_system_failure_rate": {
+            "fails": 34147,
+            "passes": 25799,
+            "value": 0.43037066693357356
+        },
+        "sag_dataplane_bridge_status_total{status:429}": {
+            "count": 0,
+            "rate": 0,
+            "thresholds": {
+                "rate>=0": false
+            }
+        },
+        "http_req_tls_handshaking": {
+            "avg": 0.945803159510222,
+            "min": 0,
+            "med": 0,
+            "max": 77.5126,
+            "p(90)": 3.7495,
+            "p(95)": 5.03365
+        },
+        "sag_chain_success_rate": {
+            "passes": 34147,
+            "fails": 25799,
+            "value": 0.5696293330664265
+        },
+        "dropped_iterations": {
+            "count": 10033,
+            "rate": 77.17879460332391
+        },
+        "sag_api_failure_http_status_total": {
+            "passes": 25799,
+            "fails": 0,
+            "value": 1
+        },
+        "sag_api_success_rate{api:auth_login}": {
+            "passes": 0,
+            "fails": 0,
+            "thresholds": {
+                "rate>0.98": false
+            },
+            "value": 0
+        },
+        "sag_api_success_rate{api:policy_list}": {
+            "fails": 0,
+            "passes": 0,
+            "thresholds": {
+                "rate>0.98": false
+            },
+            "value": 0
+        },
+        "sag_api_failure_http_status_total{api:dataplane_get,status:429}": {
+            "passes": 0,
+            "fails": 0,
+            "thresholds": {
+                "rate>=0": false
+            },
+            "value": 0
+        },
+        "sag_chain_business_reject_rate": {
+            "passes": 0,
+            "fails": 59946,
+            "value": 0
+        },
+        "iteration_duration": {
+            "min": 4.5799,
+            "med": 2833.133,
+            "max": 30119.481,
+            "p(90)": 30020.7405,
+            "p(95)": 30024.328975,
+            "avg": 13876.355428091903
+        },
+        "sag_api_latency_ms": {
+            "p(90)": 30018.0743,
+            "p(95)": 30021.22245,
+            "avg": 13874.937229916846,
+            "min": 4.5799,
+            "med": 2832.8755499999997,
+            "max": 30119.481
+        },
+        "sag_api_status_total": {
+            "rate": 461.1342590741408,
+            "count": 59946
+        },
+        "sag_api_failure_http_status_total{api:dataplane_get,status:0}": {
+            "passes": 0,
+            "fails": 0,
+            "thresholds": {
+                "rate>=0": false
+            },
+            "value": 0
+        },
+        "http_req_failed": {
+            "passes": 25799,
+            "fails": 34147,
+            "thresholds": {
+                "rate<0.02": true
+            },
+            "value": 0.43037066693357356
+        },
+        "data_received": {
+            "count": 69143863,
+            "rate": 531888.7671242268
+        },
+        "vus_max": {
+            "value": 11511,
+            "min": 2000,
+            "max": 11511
+        },
+        "vus": {
+            "max": 11460,
+            "value": 82,
+            "min": 82
+        },
+        "http_req_connecting": {
+            "max": 13.3679,
+            "p(90)": 1.1606,
+            "p(95)": 1.7247750000000002,
+            "avg": 0.261580040369666,
+            "min": 0,
+            "med": 0
+        },
+        "http_req_waiting": {
+            "p(95)": 30021.014949999997,
+            "avg": 13874.806707067959,
+            "min": 4.5799,
+            "med": 2832.5792,
+            "max": 30119.481,
+            "p(90)": 30017.893750000003
+        },
+        "sag_api_success_rate{api:control_routes_list}": {
+            "passes": 0,
+            "fails": 0,
+            "thresholds": {
+                "rate>0.98": false
+            },
+            "value": 0
+        },
+        "http_req_duration{expected_response:true}": {
+            "avg": 1681.120144706709,
+            "min": 4.5799,
+            "med": 819.5638,
+            "max": 29988.0443,
+            "p(90)": 3514.1844000000006,
+            "p(95)": 7188.161429999992
+        }
+    },
+    "setup_data": {},
+    "root_group": {
+            "id": "d41d8cd98f00b204e9800998ecf8427e",
+            "groups": {},
+            "checks": {
+                    "dataplane status acceptable": {
+                        "fails": 25799,
+                        "name": "dataplane status acceptable",
+                        "path": "::dataplane status acceptable",
+                        "id": "227d4db312795531eb2594a4514041e7",
+                        "passes": 34147
+                    }
+                },
+            "name": "",
+            "path": ""
+        }
+}

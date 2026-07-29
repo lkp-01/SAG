@@ -1,0 +1,9 @@
+[package]
+name = "sag-service-health"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+tokio.workspace = true
+metrics.workspace = true

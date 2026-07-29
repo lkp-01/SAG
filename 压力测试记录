@@ -1,0 +1,306 @@
+# SAG 压力测试记录
+
+> 本文档由自动化压测与代码审阅更新；原始数据见 `artifacts/k6-record-*.json`。
+
+---
+
+## 环境与版本（2026-05-07）
+
+| 项 | 值 |
+|----|-----|
+| 代码分支 / commit | `clean-main` / `1580ad6d`（首轮记录基线） |
+| `39ce5868` 合入后 Poll202 复测 | 见下文「2026-05-07 复测」；**远端 bridge/Redis 是否已随该 commit 部署须现场核对** |
+| 压测执行机 | Windows（本机 k6） |
+| k6 版本 | k6 v1.7.1 |
+| 目标环境 | `192.168.8.87`（Auth 8080 / Policy 8081 / Control 8090，数据面 `https://192.168.8.87:10080/dev/`） |
+| 脚本入口 | `scripts/ops/run-load-dataplane.ps1` + `load-dataplane-k6.js` |
+
+**口径说明**
+
+- `dataplane_only` + `ConstantRps=N`：目标为 **数据面 GET 约 N 次/秒**（每迭代 1 次 GET）。
+- `mixed_fullchain` + `ConstantRps=N`：目标为 **全链路迭代 N 次/秒**（每迭代含 login/verify/policy/dataplane 等多 HTTP，≠ 单独数据面 RPS）。
+- `setup()` 会在 k6 控制台打印 `requestTimeout` 等，便于核对是否与入口反代超时一致。
+
+---
+
+## 本轮已落地的性能相关优化（commit `1580ad6d` 及前后）
+
+- **http-tunnel-bridge**
+  - 默认 gRPC 转发超时由 **8s → 60s**（`SAG_BRIDGE_FORWARD_TIMEOUT_MS`，compose 与二进制 `unwrap_or` 对齐）。
+  - Redis 队列 worker：**并发默认 4 → 32**；`XREADGROUP` 批量 **8 → 32**，减轻 Redis 往返。
+  - **SOFT_INFLIGHT**：compose 曾 **64 → 256**；合入 **`39ce5868`** 后 **edge 默认改为 128**（更早 202，须 Redis + k6 **`-PollDataplane202`** 验证）。
+- **k6 / ps1**
+  - `dataplane_only` 默认 **maxVUs 12000**、**preAllocated 2000**（脚本）；PowerShell 默认 **MaxVUs 12000**、**PreAllocated 2000**，避免 arrival-rate 场景过早 `Insufficient VUs`。
+  - `export function setup()` 打印 JSON 配置摘要。
+- **sag-connector**（背压与可观测性）
+  - **有界** `SAG_CONNECTOR_ACCEPT_QUEUE` + **并发上限** `SAG_CONNECTOR_MAX_INFLIGHT`（`FuturesUnordered`，无 per-request `spawn`）；队列满返回 **503**（`connector_forward_reject_total`）。
+  - **`SAG_CONNECTOR_HTTP_TIMEOUT_MS`**（默认 55s）与 **`SAG_CONNECTOR_GRPC_CHANNEL_TIMEOUT_MS`**（默认 120s）；指标 **`connector_forward_accept_wait_seconds`** / **`connector_forward_upstream_seconds`** / **`connector_forward_out_send_seconds`**。
+  - 审计写入经 **`SAG_CONNECTOR_AUDIT_QUEUE`** 有界 channel + 单 worker；满则 **`connector_audit_dropped_total`**。可选 **`SAG_CONNECTOR_MAX_RESPONSE_BODY_BYTES`**（`0` 关闭）。
+
+---
+
+## 2026-05-07 实测记录
+
+### A. 仅数据面 — 恒定 150 RPS（舒适区）
+
+**命令摘要**
+
+```text
+run-load-dataplane.ps1 -RunMode dataplane_only -ScenarioType dataplane_only -ConstantRps 150
+  -MaxVUs 8000 -PreAllocatedVUs 1500 -RequestTimeout 90s
+  -AcceptDataplane202 -AcceptDataplane429Shed
+  -Stage1..4: 25s/25s/25s/40s
+```
+
+**结果摘要**（`artifacts/k6-record-dataplane-150.json`）
+
+| 指标 | 值 |
+|------|-----|
+| 完成迭代 / 吞吐 | 17246，**~149.9 iter/s** |
+| `http_req_failed` | **0%** |
+| `dataplane_get` 成功率 | **100%** |
+| `http_req_duration` p(95) / p(99) | **~61ms / ~193ms** |
+| 数据面 HTTP 状态 | 全部为 **200**（**202 / 429 = 0**） |
+| `dropped_iterations` | **0** |
+
+**结论**：当前链路在 **~150 数据面 RPS** 下稳定，延迟极低；未触发 bridge 排队（202）。
+
+---
+
+### B. 仅数据面 — 恒定 400 RPS（高压）
+
+**命令摘要**
+
+```text
+run-load-dataplane.ps1 -RunMode dataplane_only -ScenarioType dataplane_only -ConstantRps 400
+  -MaxVUs 10000 -PreAllocatedVUs 3000 -RequestTimeout 90s
+  -AcceptDataplane202 -AcceptDataplane429Shed
+  -Stage1..4: 20s/20s/20s/35s
+```
+
+**结果摘要**（`artifacts/k6-record-dataplane-400.json`）
+
+| 指标 | 值 |
+|------|-----|
+| 完成迭代 / 吞吐 | 36983，**~303.4 iter/s**（低于目标 400） |
+| `http_req_failed` | **2.70%**（999 次） |
+| `dataplane_get` 成功率 | **97.29%** |
+| `http_req_duration` p(95) / max | **~11.4s / ~30.0s** |
+| `dropped_iterations` | **997** |
+| 数据面 HTTP 状态 | **200** 为主；**202 / 429 = 0** |
+
+**瓶颈判断**
+
+1. **吞吐未达 400**：在尾延迟升高时，VU 与迭代耗时乘积限制 arrival-rate，出现 **`dropped_iterations`**。
+2. **约 2.7% 失败 + max≈30s**：与历史现象一致，优先怀疑 **TLS 入口 / 反代 / 某跳读超时 ~30s** 或队列堆积导致客户端超时；非业务 403。
+3. **仍无 202**：说明在当时 **SOFT_INFLIGHT=256** 与延迟分布下，多数请求仍走 **同步转发**。仓库 **edge compose 默认已改为 `SAG_BRIDGE_SOFT_INFLIGHT=128`**；压测请使用 **`run-load-dataplane.ps1 -PollDataplane202`**（`SAG_DP_POLL_202=1`）在 202 后轮询 **`/__sag/queue/.../status`**，否则不要把 202 当终态成功率。
+
+---
+
+### C. 全链路（SteadyFullchain）— 恒定 120 迭代/秒
+
+**命令摘要**
+
+```text
+run-load-dataplane.ps1 -RunMode strict -ScenarioType mixed_fullchain -SteadyFullchain
+  -ConstantRps 120 -MaxVUs 4000 -PreAllocatedVUs 800 -RequestTimeout 60s
+  -AcceptDataplane202 -AcceptDataplane429Shed
+  -Stage1..4: 20s/20s/20s/25s
+```
+
+**结果摘要**（`artifacts/k6-record-fullchain-120.json`）
+
+| 指标 | 值 |
+|------|-----|
+| 完成迭代 | 10198，**~119.9 iter/s** |
+| `sag_chain_success_rate` | **100%** |
+| `auth_login` / `auth_verify` / `policy_evaluate` / `dataplane_get` | **均为 100%** |
+| `http_req_failed` | **0%**（总 HTTP 40792） |
+| `http_req_duration` p(95) | **~101ms** |
+| 数据面状态 | **全部为 200**（202/429=0） |
+
+**结论**：在 **LoginEveryN=100、无 control/policy-list 干扰** 的稳态全链路配置下，**120 迭代/秒** 可 **全绿通过** strict 阈值；说明瓶颈主要在「更高 RPS 的数据面-only 高压」与「入口超时」，而非基础全链路逻辑错误。
+
+---
+
+## 场景 B：高延迟与 VU / dropped 诱因（分析）
+
+### 因果链（简）
+
+1. **400 RPS 目标**下，数据面请求在 **bridge → agent → connector → 上游(如 APISIX/业务)** 排队；connector 侧已实现 **有界 accept 队列 + 固定并发 dispatcher**（旧版为无界 `spawn` + 后置 semaphore，易内存与尾延迟爆炸），队列等待仍体现在 **`connector_forward_accept_wait_seconds`** / 面板延迟上。
+2. **k6 `ramping-arrival-rate`**：每完成 1 次迭代才释放 VU。若单次迭代耗时 \(L\) 秒，要维持 \(R\) 次/秒理论上需要约 \(R \times L\) 个并发 VU；\(L\) 变大 → 需要更多 VU，否则出现 **`dropped_iterations`**（场景 B 约 997 次）。
+3. **~30s 硬顶**的重要来源（代码层，已修正默认）：`http-tunnel-bridge` 建连时 tonic **`Endpoint::timeout`** 使用 **`SAG_GRPC_RPC_TIMEOUT_MS`（原默认 30000ms）**，这是 **整条 unary `forward` 的 gRPC 期限**，与 `SAG_BRIDGE_FORWARD_TIMEOUT_MS`（60s）**不一致**时，会先被 **30s gRPC 层掐断**，表现为 k6 `max≈30s`，**不等于**业务主动「熔断缓存」。
+4. **为何没有「threshold 拦截 + 缓存减压」**：
+   - **negative_cache**（agent）只缓存 **确定性失败**：无路由、**心跳判定**的 *tunnel unhealthy*、以及 **策略 DENY** 等；**不会**对「connector 慢 / 上游 502 / 排队长」做 **成功响应体缓存**（避免错误数据面语义）。
+   - **隧道健康**依赖 **heartbeat 时间窗**（`tunnel_healthy_window_sec`），**心跳仍正常但上游极慢**时，仍视为 healthy，会继续 **`send_request_to_connector` 并等待** `forward_timeout_ms`（默认 60s），与 bridge 侧旧 **30s gRPC** 叠加即出现 **客户端先失败、链路仍堵**。
+   - **bridge 软阈值 + Redis 202**：用于 **bridge 同步 inflight** 超限时 **排队**；场景 B 里 **202=0** 多与 **SOFT_INFLIGHT 较大**、或 **请求在更下游堆积** 有关；**不是**「connector 面板 >30s 自动走缓存」这条路径。
+
+### 已做配置优化（仓库）
+
+- `docker-compose.edge.yml`：`SAG_GRPC_RPC_TIMEOUT_MS` 默认 **30000 → 120000**（须 **≥** `SAG_BRIDGE_FORWARD_TIMEOUT_MS`，否则仍会出现「60s 配置但 30s 断」）。
+- **edge**：`SAG_BRIDGE_SOFT_INFLIGHT` 默认 **256 → 128**（更早 202 入队，须 **Redis** `SAG_BRIDGE_REDIS_URL` + worker 正常）；`stealth-tunnel-agent` 增加 **`SAG_FORWARD_TIMEOUT_MS=58000`**、**`SAG_MAX_PENDING_WAITERS=8192`** 与 connector HTTP 阶梯对齐。
+- **k6**：`-PollDataplane202` + 指标 **`sag_dataplane_queue_poll_total`**；可选 **`SAG_DP_POLL_MAX_MS`** / **`SAG_DP_POLL_INTERVAL_MS`**。
+
+### 仍可做的优化方向
+
+- **connector**：按环境调 `SAG_CONNECTOR_MAX_INFLIGHT` / `SAG_CONNECTOR_ACCEPT_QUEUE`；核对 `SAG_CONNECTOR_HTTP_TIMEOUT_MS` 与 agent/bridge 超时阶梯；观察 `connector_forward_accept_wait_seconds`、`connector_forward_out_send_seconds`、`connector_forward_reject_total`；扩容上游与 APISIX。
+- **bridge**：edge 默认 soft 已 **128**；按需再调并看 **`bridge_queue_202_total`** / **`bridge_queue_depth`**；**务必**客户端或 k6 **poll**（见上）。
+- **入口**：10080 前反代读超时与 k6 **对齐 ≥ 90s**。
+
+---
+
+## 后续优化与排查清单（待环境执行）
+
+1. **同步部署**：`git pull` 后重建 **http-tunnel-bridge**（`docker-compose.edge.yml`）与 **sag-connector**（`docker compose -f docker-compose.intra.yml up -d --build sag-connector` 或根目录 `docker-compose.yml`），再复测 **场景 B**；对比 `http_req_duration`、`connector_forward_accept_wait_seconds` / `connector_forward_out_send_seconds`、`connector_forward_reject_total`（accept 队列满时 **503**）。
+2. **核对超时链**：**`SAG_GRPC_RPC_TIMEOUT_MS` ≥ `SAG_BRIDGE_FORWARD_TIMEOUT_MS`**；**`SAG_CONNECTOR_HTTP_TIMEOUT_MS`** 宜短于 agent `forward_timeout`；并检查 **10080 前反代 / Zentinel** 的 `proxy_read_timeout` 等，建议 **≥ 90s** 与 k6 `-RequestTimeout` 对齐。
+3. **观察 bridge 指标**（部署后）：`curl http://<bridge>:9000/metrics | grep -E 'bridge_queue_|bridge_sync_inflight|bridge_soft_gate_entered_total|bridge_soft_fallback_total'`（`enqueue`、`202`、`worker_forward`、reject 原因；**`bridge_sync_inflight`** 用于判断是否「从未叠到 soft」）。Windows 侧可用 `scripts/ops/snapshot-bridge-metrics.ps1 -BridgeBaseUrl http://<edge>:9000`。
+4. **多档连跑**：用 `scripts/ops/run-dataplane-sweep.ps1 -RpsList "300,500,700" -CooldownSeconds 120 -PollDataplane202 ...`，避免同 shell 连续加压导致不可比；优化结论见 `docs/ops/dataplane-optimization-plan.md`。
+5. **压测异步队列**：`run-load-dataplane.ps1 ... -AcceptDataplane202 -PollDataplane202`（或设 `SAG_DP_POLL_202=1`），再扫 RPS 对比 **`sag_dataplane_bridge_status_total{status:202}`** 与最终 **`dataplane_get`** 成功率。
+
+---
+
+## 2026-05-07 复测：`39ce5868` 合入后，`dataplane_only` + `-PollDataplane202`（同一目标 `192.168.8.87`）
+
+**命令模板**（各档独立时长 4×25s，`MaxVUs=12000`，与早先 bottleneck 扫测口径一致）：
+
+```text
+run-load-dataplane.ps1 -SkipPrecheck -RunMode dataplane_only -ConstantRps <N>
+  -RequestTimeout 90s -Stage1Duration 25s -Stage2Duration 25s -Stage3Duration 25s -Stage4Duration 25s
+  -MaxVUs 12000 -PreAllocatedVUs 2000 -AcceptDataplane202 -PollDataplane202 -AcceptDataplane429Shed
+```
+
+**说明（Prometheus）**：k6 summary **不含** bridge `bridge_queue_*` 与 connector `connector_forward_*`；须在 **Edge** 上执行例如：  
+`curl -s http://127.0.0.1:9000/metrics | grep -E 'bridge_queue_|bridge_queue_202'`；**Intra** `curl -s http://<connector>:9103/metrics | grep connector_forward_`。
+
+### 与上一轮（无 Poll，无 202）对比 — **500 RPS**
+
+| 指标 | 上一轮 `k6-bottleneck-…-dp-500.json` | 本轮 `k6-poll202-20260507-143707-dp-500.json` |
+|------|--------------------------------------|---------------------------------------------|
+| 迭代吞吐（iter/s） | ~332 | **~278** |
+| `sag_chain_success_rate` | ~77% | **~62%** |
+| `sag_dataplane_bridge_status_total{status:202}` | 0 | **0** |
+| `sag_dataplane_queue_poll_total` | — | **0**（无 202 则不会 poll） |
+| `sag_dataplane_bridge_status_total{status:200}` rate（≈首包 200/s） | ~256/s | **~173/s** |
+| `http_req_duration` p(95) | ~30.0s | **~30.0s** |
+| `dropped_iterations` | ~6769 | **~12042** |
+
+**结论（500）**：开启 **`-PollDataplane202` 后仍未观察到首包 HTTP 202**（`status:202` 与 `sag_dataplane_queue_poll_total` 均为 0）。除 Edge **未部署** / **Redis 不可用**（`SAG_BRIDGE_REDIS_URL` 未生效则根本无 202 分支）外，还有一条 **常见预期行为**：
+
+- bridge 仅在 **`bridge_sync_inflight`（当前同步转发中的请求数）≥ `SAG_BRIDGE_SOFT_INFLIGHT`** 时才尝试入队并返回 **HTTP 202**（见 `http-tunnel-bridge` `proxy` 逻辑）。
+- 稳态粗算：**并发同步请求 ≈ RPS × 平均单次转发耗时**（Little 定律）。例如 **500 RPS × 0.05s ≈ 25** 路并发，若 **`SAG_BRIDGE_SOFT_INFLIGHT=128`**，则 **`25 < 128`**，**整档不出现 202 是正常的**，与 Zentinel 是否改写状态码无关（`dataplane-compose.kdl` 已对 `/` 前缀转发到 bridge，`/__sag/queue/...` 同样可达）。
+
+**Edge 上建议一次看清「阈值是否触发 / Redis 是否回退」**（部署含下述指标的 bridge 版本后）：
+
+```bash
+curl -s http://127.0.0.1:9000/metrics | grep -E 'bridge_sync_inflight|bridge_soft_gate_entered_total|bridge_queue_202_total|bridge_soft_fallback_total|bridge_queue_enqueue_total'
+```
+
+- **`bridge_soft_fallback_total{reason="redis_enqueue"}>0`**：入队失败回退同步，k6 侧也会长期 **无 202**。
+- **`bridge_soft_gate_entered_total` 长期为 0** 且 **`bridge_sync_inflight` scrape 峰值 ≪ soft**：说明 **仅阈值未触发**；要 **刻意验证 202 + poll**，可临时把 **`SAG_BRIDGE_SOFT_INFLIGHT` 调到 32 或更低**，或提高 RPS/尾延迟使并发叠高后再看 **`bridge_queue_202_total`**。
+
+### 700 / 900 / 1000 RPS（本轮为 **同一 shell 连续四档**）
+
+| 档 | 文件 | `dataplane_get` 成功 | `status:202` | `poll_total` | 备注 |
+|---|------|----------------------|--------------|--------------|------|
+| 700 | `artifacts/k6-poll202-20260507-143707-dp-700.json` | **0%** | 0 | 0 | 与 500 档间隔短，**全量超时/失败形态**；不宜与历史单档 JSON 做数值横比 |
+| 900 | `artifacts/k6-poll202-20260507-143707-dp-900.json` | **0%** | 0 | 0 | 同上 |
+| 1000 | `artifacts/k6-poll202-20260507-143707-dp-1000.json` | **0%** | 0 | 0 | 同上；`dropped_iterations` 很高 |
+
+**结论（700–1000）**：本轮后三档 **不具备与 2026-05-07 早先 `k6-bottleneck-*-dp-{700,900,1000}.json` 对比的有效性**（会话级崩溃/限流/资源耗尽）。**建议**：每档 **单独冷启动**一轮、档间 **冷却 2–5 分钟**，并确认目标机健康后再归档。
+
+### 是否继续动 sag-connector 代码
+
+当前 **未再开** connector 侧增量改动：在 **首包 202 仍未出现** 的前提下，**有效 200/s 平台** 仍由 **同步链路吞吐** 决定；**待 Edge 确认 202 + poll 全链路生效** 后，若 **`connector_forward_accept_wait_seconds` ≫ `upstream_seconds`** 仍占主导，再按 README 做 **out_send 与 HTTP 解耦** 或调 **`SAG_CONNECTOR_*`**。
+
+---
+
+## 原始数据文件索引
+
+| 文件 | 场景 |
+|------|------|
+| `artifacts/k6-record-dataplane-150.json` | 数据面 150 RPS |
+| `artifacts/k6-record-dataplane-400.json` | 数据面 400 RPS |
+| `artifacts/k6-record-fullchain-120.json` | 全链路 steady 120 iter/s |
+| `artifacts/k6-bottleneck-20260507-104527-dp-500.json` 等 | 数据面 500/700/900/1000（**无** Poll，历史扫测） |
+| `artifacts/k6-poll202-20260507-143707-dp-*.json` | 数据面 500/700/900/1000（**`-PollDataplane202`**，`39ce5868` 后复测） |
+
+---
+
+---
+
+## 2026-05-07 晚：Windows `run-dataplane-sweep`（`k6-sweep-20260507-171628`）
+
+**命令**：`run-dataplane-sweep.ps1 -RpsList "300,500,700" -CooldownSeconds 120` + `-SkipPrecheck -AcceptDataplane202 -PollDataplane202 -AcceptDataplane429Shed` + `-RequestTimeout 90s -MaxVUs 12000 -PreAllocatedVUs 2000`。
+
+| 档 | iters/s 约 | `http_req_failed` | `dataplane_get` 成功 | p95 约 | `dropped_iter/s` 约 | 备注 |
+|----|------------|---------------------|------------------------|--------|------------------------|------|
+| 300 | 178 | 100% | 0% | 30.0s | 52 | 全档 **无** 200/202/429 子桶时多为 **首包 status=0**（见 k6 脚本说明） |
+| 500 | 311 | 100% | 0% | 30.0s | 109 | `Insufficient VUs` @12000 |
+| 700 | 314 | 100% | 0% | 30.0s | 257 | 同上 |
+
+**诊断要点**：p95 顶 **30s** 与 `http-tunnel-bridge` 内 **tonic `Endpoint::timeout`（`SAG_GRPC_RPC_TIMEOUT_MS`，代码默认 30000ms）** 先于 90s k6 超时一致；Edge 须确认运行中环境变量。根目录简表与可复制 curl 见仓库根 `压力测试记录`。
+
+---
+
+## 2026-05-07 晚：Windows `run-dataplane-sweep`（`k6-sweep-20260507-183214`，网页冒烟已恢复后复测）
+
+**命令**：`run-dataplane-sweep.ps1 -RpsList "300,500,700" -CooldownSeconds 90` + `-SkipPrecheck -AcceptDataplane202 -PollDataplane202 -AcceptDataplane429Shed` + `-RequestTimeout 90s -MaxVUs 12000 -PreAllocatedVUs 2000`；数据面目标 `https://192.168.8.87:10080/dev/`。  
+**产物**：`artifacts/k6-sweep-20260507-183214-dp-300.json`、`-dp-500.json`、`-dp-700.json`。
+
+| 档 (RPS) | iters/s 约 | `iterations` 计数 | `http_req_failed` 约 | `sag_api_success_rate{dataplane_get}` | `bridge_status{200}` 计数 | `dropped_iterations` 计数 | `queue_poll_total` | 备注 |
+|----------|------------|-------------------|----------------------|----------------------------------------|-----------------------------|---------------------------|---------------------|------|
+| 300 | ~254.7 | 29296 | **~9.2%** | **~90.8%** | 26605 | 108 | 0 | 与 `171628` 全红对比，**链路已可大量 200**；仍有尾部 **p95≈30s** 簇 |
+| 500 | ~306.4 | 35273 | **~83.5%** | **~16.5%** | 5827 | 11730 | 0 | **有效吞吐塌陷**：`http_req_duration` **med≈30s**、大量 `sag_api_system_failure_total`；档内 **无 202 / 无 poll** |
+| 700 | ~440.7 | 50773 | **~40.7%** | **~59.3%** | 30101 | 14248 | 0 | **双模**：`med` 约 **1s** 与 **p90/p95≈30s** 并存；仍无 202/poll |
+
+**与 `171628` 对比**：同一脚本与相近 VU 上限下，**300 RPS 从 0% 成功恢复到约 91%**，说明此前 **30s gRPC 期限 / 隧道不可用** 类问题已缓解或消除；**500 RPS 仍明显过载**（非「全 0 状态码」假象：本批 JSON 里 `bridge_status{200}` 与 `dataplane_get` 成功计数一致，失败侧多记入 **`sag_api_system_failure_total` / `sag_api_errors_total`**；子桶上 **`bridge_status_total` 计数 35271 = 200 桶 5827 + 未在 summary 单独列出的其余 `status` 桶**（k6 仅对配置了阈值的 tag 展开），已在 `load-dataplane-k6.js` 为 **502/503/504、failure_cause** 等补阈值，便于下一批归档直接读桶）。
+
+**结论与后续**：**202 异步路径仍未触发**（`queue_poll_total`、`bridge_status{202}` 均为 0），说明在测得负载下 **`bridge_sync_inflight` 未持续顶到 soft 门限** 或同步路径已先饱和。**500 RPS** 建议单独做一轮 **档间更长冷却 + Edge/Intra 指标**（`connector_tunnel_up`、`bridge_*`、`h2` 报错）对照 `docs/ops/dataplane-optimization-plan.md`，而非仅调 Zentinel URL。
+
+### 代码层跟进（高并发路径锁竞争）
+
+结合上表 **300/500/700 RPS** 下同步路径占主导、尾延迟 **~30s** 的形态，对 **Edge 侧热点** 做了以下改动（减轻「每请求抢同一把异步锁」的串行化，不替代 **调 soft / 调 connector 并发** 等运维手段）：
+
+| 组件 | 问题 | 修改 |
+|------|------|------|
+| `http-tunnel-bridge` | 每个 HTTP 请求在发起 `Forward` RPC 前对 `tunnel_client` 使用 **`tokio::Mutex`**，高并发下等价于**串行取 client** | 改为 **`tokio::sync::RwLock`**：常态 **`read` + clone** tonic client；仅在重连时 **`write`** 替换 |
+| `stealth-tunnel-agent` | `ConnectorRegistry.outbound` 使用 **`tokio::Mutex`**，每个 `send_request_to_connector` 在查 endpoint → sender 时与其它 forward **互斥** | `outbound` 改为 **`std::sync::RwLock`**（仅 clone `mpsc::Sender` 时持读锁）；`pending` 改为 **`std::sync::Mutex`**（纯同步短临界区） |
+| `http-tunnel-bridge` `queue.rs` | 文档曾写 worker **32**，代码默认仍为 **4**，Redis 队列一旦启用会拖慢 dequeue | **`SAG_BRIDGE_WORKER_CONCURRENCY` 默认 4 → 32**（仍可用环境变量覆盖） |
+
+部署后请再跑 **`run-dataplane-sweep`** 与 Edge/Intra 指标快照对比历史 JSON。
+
+### 700 RPS ≥90% 实施（计划落地）
+
+**目标**：`dataplane_only` 目标 **700 RPS**、`Poll202` 开启时 **`sag_api_success_rate{api:dataplane_get} ≥ 0.90**；`bridge_queue_202_total` / `bridge_tunnel_shed_to_queue_total` 在高压下**可非零**；`dropped_iterations` 相对历史扫测下降（k6 **MaxVUs 默认 20000** / **PreAllocated 3000**）。
+
+| 项 | 说明 |
+|----|------|
+| **Edge `docker-compose.edge.yml`** | `SAG_BRIDGE_SOFT_INFLIGHT` 默认 **48**；新增 **`SAG_BRIDGE_MAX_TUNNEL_INFLIGHT` 默认 1024**（并发 unary `Forward` 上限；HTTP 同步路径 **try** 失败且 Redis 可用时 **优先 202 入队**）；`SAG_AGENT_STREAM_BUFFER` 默认 **8192** |
+| **`http-tunnel-bridge` 代码** | `tunnel_inflight` 信号量；`bridge_tunnel_try_saturated_total`、`bridge_tunnel_shed_to_queue_total`、`bridge_tunnel_saturated_503_total` 等指标 |
+| **Intra `docker-compose.intra.yml`** | `SAG_CONNECTOR_STREAM_BUFFER` **8192**、`SAG_CONNECTOR_MAX_INFLIGHT` **2048** |
+| **二进制默认** | connector/agent **stream buffer**、connector **max_inflight** 与 compose 对齐；详见 `docs/ops/dataplane-optimization-plan.md` **§4** |
+
+---
+
+## 2026-05-08 重构部署后：`run-dataplane-sweep`（`k6-sweep-20260508-095645`）
+
+**命令**：`run-dataplane-sweep.ps1 -RpsList "300,500,700" -CooldownSeconds 90 -SkipPrecheck -AcceptDataplane202 -PollDataplane202 -AcceptDataplane429Shed -RequestTimeout 90s -MaxVUs 20000 -PreAllocatedVUs 3000`，数据面 `https://192.168.8.87:10080/dev/`。  
+**产物**：`artifacts/k6-sweep-20260508-095645-dp-300.json`、`-dp-500.json`、`-dp-700.json`。
+
+| 档 (RPS) | `dataplane_get` 成功 | `http_req_failed` | 备注 |
+|----------|----------------------|-------------------|------|
+| 300 | **100%**（29982/29982） | **0%** | p95 约 **1.07s**，max 约 **18.5s**；`queue_poll` / `bridge_status{202}` 仍为 **0** |
+| 500 | **0%** | **100%** | **全部失败为 HTTP 403**（`sag_api_failure_http_status_total{dataplane_get,status:403}` 与迭代数一致）；与历史 `183214`（约 16.5% 成功）形态不同，**优先查 Zentinel/入口策略/鉴权**，非纯 dataplane 吞吐 |
+| 700 | **约 55.7%**（36619/65755） | **约 44.3%** | 失败侧 **`bridge_status{503}`** 约 25020、**`{504}`** 约 4112、**`{502}`** 4；**`dropped_iterations` 约 3403**；仍未观察到 **202 / poll** |
+
+**结论**：300 档健康；**500 档需单独复现 403**（curl/k6 单请求对比、Zentinel 日志）；700 档未达 **90%** 目标，且 **异步 202 在 k6 汇总中仍未出现**，建议在 Edge 拉 **`bridge_queue_202_total`、`bridge_tunnel_*`** 与 Intra **`connector_forward_reject_total`** 对照本批 JSON。
+
+**与「云枢 / 通道残留」关系**：**HTTP 403** 在链路中多来自 **stealth-tunnel-agent 策略/鉴权拒绝**（指标 `agent_forward_http_403_total{reason=...}`），与 **connector gRPC 隧道长驻**无直接对应；策略 Moka 默认 TTL 仅约 **10s**，亦非典型「永久脏数据」。若仍希望压测前 **清零进程内策略缓存与 policy coalesce map**，可使用 agent **`SAG_AGENT_DEBUG_ADMIN=1`** 后 **`POST /debug/clear-ephemeral-caches`**（见 README；**不**清 Redis 队列、**不断**隧道）。
+
+### 700 单档复跑（`k6-sweep-20260508-101923-dp-700`）
+
+**命令**：仅 **700** RPS、`CooldownSeconds=0`，其余同 `095645`。  
+**结果**：**`dataplane_get` 0%**、**首包与 bridge 汇总均为 403**（约 69968 次），**无** 200/503/504；与同日上午三连扫中 700 档（约 **55.7%** 成功、大量 5xx）**不一致**。  
+**解读**：更像 **策略/身份路径在当时的统一拒绝** 或 **远端配置变更**，不宜用「隧道未关」单因解释；请在 agent 上看 **`agent_forward_http_403_total{reason=...}`** 与 **sag-policy** 日志对比两次运行间隔内是否有变更。
+
+*（完）*

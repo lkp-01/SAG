@@ -1,0 +1,14 @@
+# Development artifacts are bind-mounted at runtime and are not needed to build
+# the shared Rust toolchain image.
+.git
+.agents
+.codex
+.cargo
+.npm-cache
+artifacts
+data
+target
+**/node_modules
+**/dist
+**/.next
+**/*.tsbuildinfo

@@ -1,0 +1,96 @@
+# Release overrides for EDGE host only.
+# This file intentionally excludes `sag-connector` (runs on intra host).
+#
+# Usage (edge):
+#   docker-compose -f docker-compose.edge.yml -f docker-compose.release.edge.yml up -d --build
+#
+services:
+  postgres:
+    profiles: ["development-storage"]
+    environment:
+      POSTGRES_PASSWORD: ${SAG_POSTGRES_PASSWORD:?PostgreSQL password is required}
+
+  redis:
+    profiles: ["development-storage"]
+    environment:
+      REDIS_PASSWORD: ${SAG_REDIS_PASSWORD:?Redis password is required}
+
+  fake-4a:
+    profiles: ["development-identity"]
+    environment:
+      FAKE_4A_CLIENT_SECRET: ${SAG_FOURA_CLIENT_SECRET:?4A client secret is required}
+
+  control-plane-admin:
+    command: ["/workspace/target/release/control-plane-admin"]
+    stop_grace_period: 35s
+    depends_on: !reset {}
+    environment:
+      SAG_POSTGRES_DSN: ${SAG_POSTGRES_DSN:?PostgreSQL DSN is required}
+      SAG_JWT_SECRET: ${SAG_JWT_SECRET:?JWT secret is required}
+      SAG_PUBLIC_READONLY_TOKEN: ${SAG_PUBLIC_READONLY_TOKEN:?public readonly token is required}
+      SAG_AGENT_SYNC_TOKEN: ${SAG_AGENT_SYNC_TOKEN:?Agent sync token is required}
+      SAG_APISIX_ADMIN_API_KEY: ${SAG_APISIX_ADMIN_API_KEY:?APISIX Admin key is required}
+
+  sag-auth:
+    command: ["/workspace/target/release/sag-auth"]
+    stop_grace_period: 35s
+    depends_on: !reset {}
+    environment:
+      SAG_POSTGRES_DSN: ${SAG_POSTGRES_DSN:?PostgreSQL DSN is required}
+      SAG_JWT_SECRET: ${SAG_JWT_SECRET:?JWT secret is required}
+      SAG_BOOTSTRAP_ADMIN_PASSWORD: ${SAG_BOOTSTRAP_ADMIN_PASSWORD:?bootstrap Admin password is required}
+      SAG_FOURA_CLIENT_SECRET: ${SAG_FOURA_CLIENT_SECRET:?4A client secret is required}
+      SAG_SESSION_REDIS_URL: ${SAG_SESSION_REDIS_URL:?authenticated Redis session URL is required}
+
+  sag-policy:
+    command: ["/workspace/target/release/sag-policy"]
+    stop_grace_period: 35s
+    depends_on: !reset {}
+    environment:
+      SAG_POSTGRES_DSN: ${SAG_POSTGRES_DSN:?PostgreSQL DSN is required}
+      SAG_JWT_SECRET: ${SAG_JWT_SECRET:?JWT secret is required}
+      SAG_POLICY_INTERNAL_TOKEN: ${SAG_POLICY_INTERNAL_TOKEN:?Policy internal token is required}
+      SAG_POLICY_CACHE_REDIS_URL: ${SAG_POLICY_CACHE_REDIS_URL:?authenticated Redis policy URL is required}
+
+  stealth-tunnel-agent:
+    command: ["/workspace/target/release/stealth-tunnel-agent"]
+    stop_grace_period: 35s
+    environment:
+      SAG_POSTGRES_DSN: ${SAG_POSTGRES_DSN:?PostgreSQL DSN is required}
+      SAG_AGENT_SYNC_TOKEN: ${SAG_AGENT_SYNC_TOKEN:?Agent sync token is required}
+      SAG_POLICY_INTERNAL_TOKEN: ${SAG_POLICY_INTERNAL_TOKEN:?Policy internal token is required}
+      SAG_GRPC_MTLS_ENABLED: "true"
+      SAG_GRPC_TLS_CERT: ${SAG_GRPC_TLS_CERT:?Agent server certificate path is required}
+      SAG_GRPC_TLS_KEY: ${SAG_GRPC_TLS_KEY:?Agent server key path is required}
+      SAG_GRPC_TLS_CLIENT_CA: ${SAG_GRPC_TLS_CLIENT_CA:?Connector client CA path is required}
+      SAG_CONNECTOR_CERT_BINDINGS: ${SAG_CONNECTOR_CERT_BINDINGS:?Connector certificate binding is required}
+
+  http-tunnel-bridge:
+    command: ["/workspace/target/release/http-tunnel-bridge"]
+    stop_grace_period: 35s
+    depends_on: !override
+      stealth-tunnel-agent:
+        condition: service_healthy
+    environment:
+      SAG_BRIDGE_REDIS_URL: ${SAG_BRIDGE_REDIS_URL:?authenticated Redis queue URL is required}
+      SAG_GRPC_MTLS_ENABLED: "true"
+      SAG_GRPC_TLS_CLIENT_CERT: ${SAG_GRPC_TLS_CLIENT_CERT:?Bridge client certificate path is required}
+      SAG_GRPC_TLS_CLIENT_KEY: ${SAG_GRPC_TLS_CLIENT_KEY:?Bridge client key path is required}
+      SAG_GRPC_TLS_CA: ${SAG_GRPC_TLS_CA:?Bridge CA path is required}
+      SAG_GRPC_TLS_SERVER_NAME: ${SAG_GRPC_TLS_SERVER_NAME:?Agent TLS server name is required}
+
+  zentinel:
+    command: ["/workspace/proxy/core/target/release/zentinel", "--config", "/workspace/proxy/zentinel-proxy/config/dataplane-compose.kdl"]
+
+  # Keep Next admin on production start command in one-shot edge startup.
+  frontend-admin-next:
+    command:
+      [
+        "sh",
+        "-c",
+        "npm ci --include=dev && npm run build && NODE_ENV=production npm run start -- --hostname 0.0.0.0 --port 3001"
+      ]
+
+  grafana:
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${SAG_GRAFANA_ADMIN_PASSWORD:?Grafana Admin password is required}

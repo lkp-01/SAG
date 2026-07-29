@@ -1,0 +1,509 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: sag-postgres
+    environment:
+      POSTGRES_DB: sag
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d sag"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    container_name: sag-redis
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+
+  # 官方 etcd（Bitnami 的 `bitnami/etcd:3.5` 在 Docker Hub 上已不可用/无此短标签）
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.15
+    container_name: sag-etcd
+    command:
+      - etcd
+      - --name=sag-etcd
+      - --data-dir=/etcd-data
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://etcd:2379
+      - --listen-peer-urls=http://0.0.0.0:2380
+      - --initial-advertise-peer-urls=http://etcd:2380
+      - --initial-cluster=sag-etcd=http://etcd:2380
+    ports:
+      - "2379:2379"
+    volumes:
+      - etcd_data:/etcd-data
+
+  apisix:
+    image: apache/apisix:3.10.0-debian
+    container_name: sag-apisix
+    depends_on:
+      - etcd
+    environment:
+      SAG_APISIX_ADMIN_API_KEY: ${SAG_APISIX_ADMIN_API_KEY:-your-admin-key}
+    ports:
+      - "9080:9080"
+      - "9180:9180"
+    volumes:
+      - ./infra/apisix/config.yaml:/usr/local/apisix/conf/config.yaml:ro
+
+  mock-workload:
+    image: python:3.11-slim
+    container_name: sag-mock
+    working_dir: /workspace/infra/test-workload
+    command: ["python", "mock_http_server.py"]
+    volumes:
+      - ./:/workspace
+    ports:
+      - "18080:18080"
+
+  fake-4a:
+    image: python:3.11-slim
+    container_name: sag-fake-4a
+    working_dir: /workspace/infra/fake-4a
+    command: ["python", "mock_4a_server.py"]
+    volumes:
+      - ./:/workspace
+    environment:
+      FAKE_4A_PORT: "19080"
+      FAKE_4A_CLIENT_ID: sag-local-client
+      FAKE_4A_CLIENT_SECRET: sag-local-secret
+      FAKE_4A_USERS_FILE: /workspace/infra/fake-4a/users.json
+      FAKE_4A_AUDIT_LIMIT: "500"
+      FAKE_4A_PORTAL_URL: http://${SAG_PUBLIC_HOST:-192.168.9.26}:3001/app
+      FAKE_4A_LOGIN_URL: http://${SAG_PUBLIC_HOST:-192.168.9.26}:3001/login
+    ports:
+      - "19080:19080"
+
+  control-plane-admin:
+    build:
+      context: .
+      dockerfile: ./infra/docker/rust-toolchain.Dockerfile
+    image: sag-rust-toolchain:1.94
+    container_name: sag-control-plane-admin
+    working_dir: /workspace
+    command: ["cargo", "run", "-p", "control-plane-admin", "--bin", "control-plane-admin"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      apisix:
+        condition: service_started
+    volumes:
+      - ./:/workspace
+      - cargo_registry:/usr/local/cargo/registry
+      - cargo_git:/usr/local/cargo/git
+      - target_cache:/workspace/target
+    environment:
+      SAG_STORAGE_BACKEND: postgres
+      SAG_POSTGRES_DSN: postgres://postgres:postgres@postgres:5432/sag
+      SAG_JWT_SECRET: dev-jwt-secret
+      SAG_POLICY_INTERNAL_TOKEN: ${SAG_POLICY_INTERNAL_TOKEN:-dev-policy-internal-token}
+      SAG_PUBLIC_READONLY_TOKEN: ${SAG_PUBLIC_READONLY_TOKEN:-demo-readonly-token}
+      SAG_AGENT_SYNC_TOKEN: sag-agent-sync-dev-token
+      SAG_APISIX_ADMIN_BASE_URL: http://apisix:9180
+      SAG_APISIX_ADMIN_API_KEY: your-admin-key
+      SAG_BOOTSTRAP_DEMO_TUNNEL_ROUTE: "true"
+    ports:
+      - "8090:8090"
+
+  sag-auth:
+    build:
+      context: .
+      dockerfile: ./infra/docker/rust-toolchain.Dockerfile
+    image: sag-rust-toolchain:1.94
+    container_name: sag-auth
+    working_dir: /workspace
+    command: ["cargo", "run", "-p", "sag-auth"]
+    depends_on:
+      - fake-4a
+      - redis
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    volumes:
+      - ./:/workspace
+      - cargo_registry:/usr/local/cargo/registry
+      - cargo_git:/usr/local/cargo/git
+      - target_cache:/workspace/target
+    environment:
+      SAG_JWT_SECRET: dev-jwt-secret
+      SAG_BOOTSTRAP_ADMIN_PASSWORD: Admin@123
+      SAG_PUBLIC_BASE_URL: http://${SAG_PUBLIC_HOST:-192.168.9.26}:8080
+      # Browser must hit Next rewrite `/api-auth/*` when using single entry :3001 (not bare `/api/v1/...` on :3001).
+      SAG_FOURA_REDIRECT_URI: http://${SAG_PUBLIC_HOST:-192.168.9.26}:3001/api-auth/api/v1/auth/sso/callback
+      SAG_FOURA_FIRST_URI: http://${SAG_PUBLIC_HOST:-192.168.9.26}:19080/oauth/authorize
+      SAG_FOURA_SECOND_URI: http://fake-4a:19080/oauth/token
+      SAG_FOURA_THIRD_URI: http://fake-4a:19080/oauth/userinfo
+      SAG_FOURA_CLIENT_ID: sag-local-client
+      SAG_FOURA_CLIENT_SECRET: sag-local-secret
+      SAG_FOURA_DEFAULT_ROLES: user
+      SAG_FOURA_ROLE_MAP: boss:boss;alice:tech;bob:ops
+      SAG_SSO_PORTAL_REDIRECT_URL: http://${SAG_PUBLIC_HOST:-192.168.9.26}:3001/app
+      SAG_SESSION_REDIS_URL: ${SAG_SESSION_REDIS_URL:-redis://redis:6379/0}
+      SAG_LOGIN_MEMO_ENABLED: ${SAG_LOGIN_MEMO_ENABLED:-true}
+      SAG_LOGIN_MEMO_TTL_SEC: ${SAG_LOGIN_MEMO_TTL_SEC:-600}
+      SAG_LOGIN_MEMO_MAX_CAPACITY: ${SAG_LOGIN_MEMO_MAX_CAPACITY:-500000}
+    ports:
+      - "8080:8080"
+
+  sag-policy:
+    build:
+      context: .
+      dockerfile: ./infra/docker/rust-toolchain.Dockerfile
+    image: sag-rust-toolchain:1.94
+    container_name: sag-policy
+    working_dir: /workspace
+    command: ["cargo", "run", "-p", "sag-policy"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./:/workspace
+      - cargo_registry:/usr/local/cargo/registry
+      - cargo_git:/usr/local/cargo/git
+      - target_cache:/workspace/target
+    environment:
+      SAG_STORAGE_BACKEND: postgres
+      SAG_POSTGRES_DSN: postgres://postgres:postgres@postgres:5432/sag
+      SAG_JWT_SECRET: dev-jwt-secret
+      SAG_POLICY_CACHE_ENABLED: "true"
+      SAG_POLICY_CACHE_TTL_SEC: "60"
+    ports:
+      - "8081:8081"
+
+  stealth-tunnel-agent:
+    build:
+      context: .
+      dockerfile: ./infra/docker/rust-toolchain.Dockerfile
+    image: sag-rust-toolchain:1.94
+    container_name: sag-stealth-agent
+    working_dir: /workspace
+    command: ["cargo", "run", "-p", "stealth-tunnel-agent"]
+    depends_on:
+      control-plane-admin:
+        condition: service_started
+      sag-policy:
+        condition: service_started
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    volumes:
+      - ./:/workspace
+      - cargo_registry:/usr/local/cargo/registry
+      - cargo_git:/usr/local/cargo/git
+      - target_cache:/workspace/target
+    environment:
+      SAG_STORAGE_BACKEND: postgres
+      SAG_POSTGRES_DSN: postgres://postgres:postgres@postgres:5432/sag
+      SAG_IDEMPOTENCY_TTL_SEC: "86400"
+      SAG_CONTROL_PLANE_SYNC_ENDPOINT: "http://control-plane-admin:8090/api/v1/agent/routes"
+      SAG_CONTROL_PLANE_SYNC_NO_LOCALHOST_FALLBACK: "true"
+      SAG_AGENT_SYNC_TOKEN: sag-agent-sync-dev-token
+      SAG_POLICY_EVALUATE_ENDPOINT: http://sag-policy:8081/api/v1/policy/evaluate
+      SAG_POLICY_INTERNAL_TOKEN: ${SAG_POLICY_INTERNAL_TOKEN:-dev-policy-internal-token}
+      SAG_AUTH_VERIFY_ENDPOINT: http://sag-auth:8080/api/v1/auth/verify
+      SAG_POLICY_DECISION_CACHE_TTL_SEC: "60"
+      SAG_POLICY_INFLIGHT_LIMIT: "2048"
+      SAG_POLICY_EVALUATE_TIMEOUT_MS: "8000"
+      # 2s heartbeat, five missed beats before the Agent revokes the session.
+      SAG_TUNNEL_HEALTHY_WINDOW_SEC: "10"
+      SAG_GRPC_KEEPALIVE_MS: "5000"
+      SAG_GRPC_KEEPALIVE_TIMEOUT_MS: "5000"
+      SAG_METRICS_LISTEN_ADDR: 0.0.0.0:9104
+      # Align with bridge forward / connector HTTP timeout ladder (see README).
+      SAG_FORWARD_TIMEOUT_MS: "58000"
+      SAG_MAX_PENDING_WAITERS: "8192"
+      # Test TLS files live in main repo (no proxy/core submodule required on deploy hosts)
+      SAG_GRPC_TLS_CERT: /workspace/infra/tls/server-default.crt
+      SAG_GRPC_TLS_KEY: /workspace/infra/tls/server-default.key
+      SAG_GRPC_TLS_CLIENT_CA: /workspace/infra/tls/ca.crt
+      # Development fixture fingerprint. Production stacks must inject unique
+      # Connector certificates and their endpoint bindings instead.
+      SAG_REQUIRE_CONNECTOR_CERT_BINDING: "true"
+      SAG_CONNECTOR_CERT_BINDINGS: "connector-local-001:stream=76594a109bcb0b7042f3b4d8ea9e3d538ee34cbdf20514f7fcbc499c7a99f013"
+    ports:
+      - "50051:50051"
+    restart: unless-stopped
+
+  company-demo-sites:
+    image: python:3.11-slim
+    container_name: sag-company-demo-sites
+    working_dir: /app
+    command: ["python", "server.py"]
+    volumes:
+      - ./infra/demo-sites:/app
+    ports:
+      - "28080:28080"
+    environment:
+      DEMO_SITES_ADDR: "0.0.0.0"
+      DEMO_SITES_PORT: "28080"
+
+  sag-connector:
+    build:
+      context: .
+      dockerfile: ./infra/docker/rust-toolchain.Dockerfile
+    image: sag-rust-toolchain:1.94
+    container_name: sag-connector
+    working_dir: /workspace
+    command: ["cargo", "run", "-p", "sag-connector"]
+    depends_on:
+      - stealth-tunnel-agent
+      - apisix
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    volumes:
+      - ./:/workspace
+      - cargo_registry:/usr/local/cargo/registry
+      - cargo_git:/usr/local/cargo/git
+      - target_cache:/workspace/target
+    environment:
+      SAG_TUNNEL_ENDPOINT: https://stealth-tunnel-agent:50051
+      # The default test cert SAN does not include `stealth-tunnel-agent` (docker DNS).
+      # Override SNI/verification name to one that exists in the cert.
+      SAG_GRPC_TLS_SERVER_NAME: localhost
+      SAG_CONNECTOR_ID: connector-local-001
+      SAG_APP_ID: app-001
+      SAG_EXTERNAL_HOST: app.internal.com
+      SAG_APISIX_BASE_URL: http://apisix:9080
+      SAG_MESH_MODE: noop
+      SAG_METRICS_LISTEN_ADDR: 0.0.0.0:9103
+      SAG_GRPC_TLS_CLIENT_CERT: /workspace/infra/tls/client.crt
+      SAG_GRPC_TLS_CLIENT_KEY: /workspace/infra/tls/client.key
+      SAG_GRPC_TLS_CA: /workspace/infra/tls/ca.crt
+      SAG_CONNECTOR_HEARTBEAT_INTERVAL_MS: "2000"
+      SAG_CONNECTOR_RECONNECT_ENABLED: "true"
+      SAG_GRPC_KEEPALIVE_MS: "10000"
+      SAG_GRPC_KEEPALIVE_TIMEOUT_MS: "5000"
+      SAG_GRPC_TCP_KEEPALIVE_MS: "10000"
+      SAG_CONNECTOR_STREAM_BUFFER: "8192"
+      SAG_CONNECTOR_MAX_INFLIGHT: "2048"
+      SAG_CONNECTOR_ACCEPT_QUEUE: "4096"
+      SAG_CONNECTOR_HTTP_TIMEOUT_MS: "55000"
+      SAG_CONNECTOR_GRPC_CHANNEL_TIMEOUT_MS: "120000"
+      SAG_CONNECTOR_MAX_RESPONSE_BODY_BYTES: "4194304"
+    restart: unless-stopped
+
+  http-tunnel-bridge:
+    build:
+      context: .
+      dockerfile: ./infra/docker/rust-toolchain.Dockerfile
+    image: sag-rust-toolchain:1.94
+    working_dir: /workspace
+    command: ["cargo", "run", "-p", "http-tunnel-bridge"]
+    depends_on:
+      - stealth-tunnel-agent
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    volumes:
+      - ./:/workspace
+      - cargo_registry:/usr/local/cargo/registry
+      - cargo_git:/usr/local/cargo/git
+      - target_cache:/workspace/target
+    environment:
+      SAG_TUNNEL_GRPC_ENDPOINT: https://stealth-tunnel-agent:50051
+      SAG_GRPC_TLS_SERVER_NAME: localhost
+      SAG_GRPC_TLS_CLIENT_CERT: /workspace/infra/tls/client.crt
+      SAG_GRPC_TLS_CLIENT_KEY: /workspace/infra/tls/client.key
+      SAG_GRPC_TLS_CA: /workspace/infra/tls/ca.crt
+      SAG_GRPC_KEEPALIVE_MS: "10000"
+      SAG_GRPC_KEEPALIVE_TIMEOUT_MS: "5000"
+      SAG_GRPC_TCP_KEEPALIVE_MS: "10000"
+      # One end-to-end budget: APISIX < connector (55s) < agent (58s) < bridge (60s).
+      SAG_BRIDGE_FORWARD_TIMEOUT_MS: "60000"
+    ports:
+      - "9000:9000"
+    restart: unless-stopped
+
+  zentinel:
+    build:
+      context: .
+      dockerfile: ./infra/docker/rust-toolchain.Dockerfile
+    image: sag-rust-toolchain:1.94
+    container_name: sag-zentinel
+    working_dir: /workspace
+    command: ["cargo", "run", "--manifest-path", "/workspace/proxy/core/Cargo.toml", "-p", "zentinel-proxy", "--bin", "zentinel", "--", "--config", "/workspace/proxy/zentinel-proxy/config/dataplane-compose.kdl"]
+    depends_on:
+      - http-tunnel-bridge
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    environment:
+      # With git-fetch-with-cli (see .cargo/config.toml), git deps respect /root/.gitconfig URL rewrites.
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+    volumes:
+      - ./:/workspace
+      - cargo_registry:/usr/local/cargo/registry
+      - cargo_git:/usr/local/cargo/git
+      - target_cache:/workspace/target
+      - ./infra/docker/zentinel-gitconfig:/root/.gitconfig:ro
+    ports:
+      - "10080:10080"
+    networks:
+      default:
+        # High address avoids collisions with other compose services on 172.19.0.0/16
+        ipv4_address: 172.19.0.250
+
+  frontend-admin:
+    image: node:20
+    container_name: sag-frontend-admin
+    working_dir: /workspace/frontend
+    command: ["sh", "-c", "npm install && npm run dev -- --host 0.0.0.0 --port 5173"]
+    depends_on:
+      - control-plane-admin
+      - sag-auth
+      - sag-policy
+    volumes:
+      - ./:/workspace
+      - frontend_admin_node_modules:/workspace/frontend/node_modules
+    environment:
+      VITE_CONTROL_PROXY_TARGET: http://control-plane-admin:8090
+      VITE_AUTH_PROXY_TARGET: http://sag-auth:8080
+      VITE_POLICY_PROXY_TARGET: http://sag-policy:8081
+      VITE_BRIDGE_PROXY_TARGET: http://http-tunnel-bridge:9000
+      VITE_ZENTINEL_PROXY_TARGET: https://zentinel:10080
+    ports:
+      - "5173:5173"
+
+  frontend-admin-next:
+    image: node:20
+    container_name: sag-frontend-admin-next
+    working_dir: /workspace/frontend-admin-next
+    command: [
+      "sh",
+      "-c",
+      "npm ci --include=dev && npm run build && NODE_ENV=production npm run start -- --hostname 0.0.0.0 --port 3001"
+    ]
+    depends_on:
+      - control-plane-admin
+      - sag-auth
+      - sag-policy
+      - prometheus
+    volumes:
+      - ./:/workspace
+      - frontend_admin_next_node_modules:/workspace/frontend-admin-next/node_modules
+    extra_hosts:
+      - "example.com:172.19.0.250"
+    environment:
+      CONTROL_PROXY_TARGET: http://control-plane-admin:8090
+      AUTH_PROXY_TARGET: http://sag-auth:8080
+      POLICY_PROXY_TARGET: http://sag-policy:8081
+      BRIDGE_PROXY_TARGET: http://http-tunnel-bridge:9000
+      ZENTINEL_PROXY_TARGET: https://example.com:10080
+      NODE_EXTRA_CA_CERTS: /workspace/infra/tls/ca.crt
+      PROM_PROXY_TARGET: http://prometheus:9090
+      GRAFANA_PROXY_TARGET: http://grafana:3000
+      NEXT_PUBLIC_GRAFANA_URL: http://${SAG_PUBLIC_HOST:-192.168.9.26}:3000
+      NEXT_PUBLIC_PROMETHEUS_URL: http://${SAG_PUBLIC_HOST:-192.168.9.26}:9091
+      NEXT_PUBLIC_REFRESH_MS: "10000"
+      npm_config_cache: /workspace/.npm-cache
+      npm_config_audit: "false"
+      npm_config_fund: "false"
+    ports:
+      - "3001:3001"
+
+  frontend-portal:
+    # Vite user portal (:5174). Primary ops console is frontend-admin-next (:3001).
+    image: node:20
+    container_name: sag-frontend-portal
+    working_dir: /workspace/frontend-portal
+    command: ["sh", "-c", "npm install && npm run dev -- --host 0.0.0.0 --port 5174"]
+    depends_on:
+      - sag-auth
+      - sag-policy
+      - zentinel
+      - company-demo-sites
+    volumes:
+      - ./:/workspace
+      - frontend_portal_node_modules:/workspace/frontend-portal/node_modules
+    extra_hosts:
+      - "example.com:172.19.0.250"
+    environment:
+      VITE_CONTROL_PROXY_TARGET: http://control-plane-admin:8090
+      VITE_AUTH_PROXY_TARGET: http://sag-auth:8080
+      VITE_POLICY_PROXY_TARGET: http://sag-policy:8081
+      VITE_ZENTINEL_PROXY_TARGET: https://example.com:10080
+      NODE_EXTRA_CA_CERTS: /workspace/infra/tls/ca.crt
+      VITE_DEMO_SITES_BASE: http://${SAG_PUBLIC_HOST:-192.168.9.26}:28080
+      VITE_ADMIN_PLANE_URL: http://${SAG_PUBLIC_HOST:-192.168.9.26}:3001
+    ports:
+      - "5174:5174"
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    container_name: sag-otel-collector
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./infra/observability/otel-collector.yaml:/etc/otelcol/config.yaml:ro
+    ports:
+      - "4317:4317"   # OTLP gRPC
+      - "4318:4318"   # OTLP HTTP
+      - "9464:9464"   # Prometheus exporter (collector)
+
+  prometheus:
+    image: prom/prometheus:v2.55.0
+    container_name: sag-prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+    volumes:
+      - ./infra/observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9091:9090"
+    depends_on:
+      - control-plane-admin
+      - sag-auth
+      - sag-policy
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    container_name: sag-grafana
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: sag-admin
+      GF_METRICS_ENABLED: "true"
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+
+  node-exporter:
+    image: quay.io/prometheus/node-exporter:v1.9.0
+    container_name: sag-node-exporter
+    ports:
+      - "9100:9100"
+
+volumes:
+  postgres_data:
+  redis_data:
+  etcd_data:
+  cargo_registry:
+  cargo_git:
+  target_cache:
+  frontend_admin_node_modules:
+  frontend_admin_next_node_modules:
+  frontend_portal_node_modules:
+
+# Static IPv4 for `zentinel` (172.19.0.250) requires a user-defined subnet; otherwise Docker errors:
+# "user specified IP address is supported only when connecting to networks with user configured subnets"
+networks:
+  default:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.19.0.0/16
+          gateway: 172.19.0.1

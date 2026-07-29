@@ -1,0 +1,4 @@
+﻿SAG gated dataplane run: 20260519-165533
+EdgeHost=172.16.9.107  AppId=app-001
+FirstRps=1000  SecondRps=1500  threshold=0.9  cooldown=300s
+Success mode: apisix_routed  VUs: pre=2000 max=10000  tier=2m x4

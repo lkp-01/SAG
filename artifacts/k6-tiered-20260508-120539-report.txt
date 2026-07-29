@@ -1,0 +1,4 @@
+﻿SAG tiered dataplane run id: 20260508-120539
+threshold: success_rate >= 0.8 -> run 900
+DATAPLANE_URL=https://192.168.8.87:10080/dev/
+2026-05-08 12:05:39Z

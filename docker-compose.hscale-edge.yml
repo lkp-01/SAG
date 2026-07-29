@@ -1,0 +1,156 @@
+# Optional Edge horizontal scale: second http-tunnel-bridge + Zentinel RR across two upstream DNS names.
+#
+# Usage (from sag-cloud/):
+#   docker compose -f docker-compose.edge.yml -f docker-compose.release.edge.yml -f docker-compose.hscale-edge.yml up -d
+#
+# Notes:
+# - `http-tunnel-bridge` keeps host publish 9000:9000 from base compose (first replica only gets the bind when scaled).
+# - `http-tunnel-bridge-2` is internal-only (no host port) to avoid 9000 collisions.
+# - Zentinel switches to dataplane-compose.hscale.kdl (two upstream targets).
+# - Exec/logs: `docker compose logs http-tunnel-bridge` or `docker compose exec http-tunnel-bridge sh` (first replica; use `ps -q` for a specific task).
+
+x-bridge-security-environment: &bridge-security-environment
+  SAG_TUNNEL_GRPC_ENDPOINT: ${SAG_TUNNEL_GRPC_ENDPOINT:-https://stealth-tunnel-agent:50051}
+  SAG_GRPC_MTLS_ENABLED: "true"
+  SAG_GRPC_TLS_CA: ${SAG_GRPC_TLS_CA:?production Bridge CA path is required}
+  SAG_GRPC_TLS_CLIENT_CERT: ${SAG_GRPC_TLS_CLIENT_CERT:?production Bridge client certificate path is required}
+  SAG_GRPC_TLS_CLIENT_KEY: ${SAG_GRPC_TLS_CLIENT_KEY:?production Bridge client key path is required}
+  SAG_GRPC_TLS_SERVER_NAME: ${SAG_GRPC_TLS_SERVER_NAME:?Agent TLS server name is required}
+
+x-ha-runtime: &ha-runtime
+  restart: unless-stopped
+  stop_grace_period: 35s
+  mem_limit: 1g
+  cpus: 2.0
+
+x-agent-security-environment: &agent-security-environment
+  SAG_STORAGE_BACKEND: postgres
+  SAG_POSTGRES_DSN: ${SAG_POSTGRES_DSN:?PostgreSQL DSN is required}
+  SAG_AGENT_SYNC_TOKEN: ${SAG_AGENT_SYNC_TOKEN:?Agent sync token is required}
+  SAG_POLICY_INTERNAL_TOKEN: ${SAG_POLICY_INTERNAL_TOKEN:?Policy internal token is required}
+  SAG_GRPC_MTLS_ENABLED: "true"
+  SAG_GRPC_TLS_CERT: ${SAG_GRPC_TLS_CERT:?Agent server certificate path is required}
+  SAG_GRPC_TLS_KEY: ${SAG_GRPC_TLS_KEY:?Agent server key path is required}
+  SAG_GRPC_TLS_CLIENT_CA: ${SAG_GRPC_TLS_CLIENT_CA:?Connector client CA path is required}
+  SAG_REQUIRE_CONNECTOR_CERT_BINDING: "true"
+  SAG_CONNECTOR_CERT_BINDINGS: ${SAG_CONNECTOR_CERT_BINDINGS:?Connector certificate binding is required}
+
+services:
+  http-tunnel-bridge:
+    environment:
+      <<: *bridge-security-environment
+      SAG_BRIDGE_INSTANCE_ID: edge-bridge-1
+      SAG_TUNNEL_GRPC_ENDPOINT: ${SAG_TUNNEL_GRPC_ENDPOINT_1:-https://stealth-tunnel-agent:50051}
+
+  stealth-tunnel-agent:
+    environment:
+      SAG_AGENT_INSTANCE_ID: edge-agent-1
+
+  http-tunnel-bridge-2:
+    <<: *ha-runtime
+    build:
+      context: .
+      dockerfile: ./infra/docker/rust-toolchain.Dockerfile
+    image: sag-rust-toolchain:1.94
+    working_dir: /workspace
+    command: ["/workspace/target/release/http-tunnel-bridge"]
+    depends_on:
+      stealth-tunnel-agent-2:
+        condition: service_healthy
+    volumes:
+      - ./:/workspace
+      - cargo_registry:/usr/local/cargo/registry
+      - cargo_git:/usr/local/cargo/git
+      - target_cache:/workspace/target
+    environment:
+      <<: *bridge-security-environment
+      SAG_DOCKER_COMPOSE: "1"
+      SAG_BRIDGE_INSTANCE_ID: edge-bridge-2
+      SAG_TUNNEL_GRPC_ENDPOINT: ${SAG_TUNNEL_GRPC_ENDPOINT_2:-https://stealth-tunnel-agent-2:50051}
+      SAG_GRPC_KEEPALIVE_MS: ${SAG_GRPC_KEEPALIVE_MS:-5000}
+      SAG_GRPC_TCP_KEEPALIVE_MS: ${SAG_GRPC_TCP_KEEPALIVE_MS:-5000}
+      SAG_BRIDGE_FORWARD_TIMEOUT_MS: ${SAG_BRIDGE_FORWARD_TIMEOUT_MS:-60000}
+      SAG_GRPC_CONNECT_TIMEOUT_MS: ${SAG_GRPC_CONNECT_TIMEOUT_MS:-5000}
+      SAG_GRPC_RPC_TIMEOUT_MS: ${SAG_GRPC_RPC_TIMEOUT_MS:-120000}
+      SAG_BRIDGE_REDIS_URL: ${SAG_BRIDGE_REDIS_URL:?authenticated HA Redis queue URL is required}
+      SAG_BRIDGE_SOFT_INFLIGHT: ${SAG_BRIDGE_SOFT_INFLIGHT:-24}
+      SAG_BRIDGE_HARD_INFLIGHT: ${SAG_BRIDGE_HARD_INFLIGHT:-128}
+      SAG_BRIDGE_MAX_TUNNEL_INFLIGHT: ${SAG_BRIDGE_MAX_TUNNEL_INFLIGHT:-128}
+      SAG_BRIDGE_QUEUE_MAX_LEN: ${SAG_BRIDGE_QUEUE_MAX_LEN:-20000}
+      SAG_BRIDGE_QUEUE_MAX_BODY_BYTES: ${SAG_BRIDGE_QUEUE_MAX_BODY_BYTES:-262144}
+      SAG_BRIDGE_QUEUE_TTL_SEC: ${SAG_BRIDGE_QUEUE_TTL_SEC:-600}
+      SAG_BRIDGE_WORKER_CONCURRENCY: ${SAG_BRIDGE_WORKER_CONCURRENCY:-16}
+      SAG_BRIDGE_QUEUE_MAX_RESULT_BODY_BYTES: ${SAG_BRIDGE_QUEUE_MAX_RESULT_BODY_BYTES:-65536}
+      SAG_BRIDGE_POLL_MIN_INTERVAL_MS: ${SAG_BRIDGE_POLL_MIN_INTERVAL_MS:-100}
+      SAG_BRIDGE_DEDUP_TTL_SEC: ${SAG_BRIDGE_DEDUP_TTL_SEC:-600}
+      SAG_BRIDGE_GRPC_CHANNEL_POOL_SIZE: ${SAG_BRIDGE_GRPC_CHANNEL_POOL_SIZE:-1}
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
+    expose:
+      - "9000"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "bash -ec 'exec 3<>/dev/tcp/127.0.0.1/9000; printf \"GET /ready HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n\" >&3; head -n 1 <&3 | grep -q \" 200 \"'"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 30s
+
+  stealth-tunnel-agent-2:
+    <<: *ha-runtime
+    build:
+      context: .
+      dockerfile: ./infra/docker/rust-toolchain.Dockerfile
+    image: sag-rust-toolchain:1.94
+    working_dir: /workspace
+    command: ["/workspace/target/release/stealth-tunnel-agent"]
+    volumes:
+      - ./:/workspace
+      - cargo_registry:/usr/local/cargo/registry
+      - cargo_git:/usr/local/cargo/git
+      - target_cache:/workspace/target
+    environment:
+      <<: *agent-security-environment
+      SAG_DOCKER_COMPOSE: "1"
+      SAG_AGENT_INSTANCE_ID: edge-agent-2
+      SAG_CONTROL_PLANE_SYNC_ENDPOINT: ${SAG_CONTROL_PLANE_SYNC_ENDPOINT:-http://control-plane-admin:8090/api/v1/agent/routes}
+      SAG_CONTROL_PLANE_SYNC_NO_LOCALHOST_FALLBACK: "true"
+      SAG_POLICY_EVALUATE_ENDPOINT: ${SAG_POLICY_EVALUATE_ENDPOINT:-http://sag-policy-lb:8081/api/v1/policy/evaluate}
+      SAG_AUTH_VERIFY_ENDPOINT: ${SAG_AUTH_VERIFY_ENDPOINT:-http://sag-auth-lb:8080/api/v1/auth/verify}
+      SAG_AGENT_MIN_CONNECTOR_SESSIONS: ${SAG_AGENT_MIN_CONNECTOR_SESSIONS:-1}
+      SAG_METRICS_LISTEN_ADDR: 0.0.0.0:9104
+      SAG_HEALTH_LISTEN_ADDR: 0.0.0.0:9105
+      SAG_MEMORY_BUDGET_BYTES: ${SAG_AGENT_MEMORY_BUDGET_BYTES:-805306368}
+    expose:
+      - "50051"
+      - "9104"
+      - "9105"
+    healthcheck:
+      test: ["CMD-SHELL", "bash -ec 'exec 3<>/dev/tcp/127.0.0.1/9105; printf \"GET /ready HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n\" >&3; head -n 1 <&3 | grep -q \" 200 \"'"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 30s
+
+  zentinel:
+    depends_on:
+      http-tunnel-bridge:
+        condition: service_healthy
+      http-tunnel-bridge-2:
+        condition: service_healthy
+    command:
+      [
+        "cargo",
+        "run",
+        "--manifest-path",
+        "/workspace/proxy/core/Cargo.toml",
+        "-p",
+        "zentinel-proxy",
+        "--bin",
+        "zentinel",
+        "--",
+        "--config",
+        "/workspace/proxy/zentinel-proxy/config/dataplane-compose.hscale.kdl"
+      ]

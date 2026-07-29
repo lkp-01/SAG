@@ -1,0 +1,146 @@
+# Release overrides for INTRA host only.
+# This file intentionally includes only `sag-connector` (and excludes edge-only services).
+#
+# Usage (intra):
+#   docker compose -f docker-compose.intra.yml run --rm sag-connector cargo build --workspace --release
+#   docker compose -f docker-compose.intra.yml -f docker-compose.release.intra.yml up -d --build
+#
+services:
+  etcd:
+    command:
+      - etcd
+      - --name=etcd-1
+      - --data-dir=/etcd-data
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://etcd:2379
+      - --listen-peer-urls=http://0.0.0.0:2380
+      - --initial-advertise-peer-urls=http://etcd:2380
+      - --initial-cluster=etcd-1=http://etcd:2380,etcd-2=http://etcd-2:2380,etcd-3=http://etcd-3:2380
+      - --initial-cluster-state=new
+
+  etcd-2:
+    image: quay.io/coreos/etcd:v3.5.15
+    command:
+      - etcd
+      - --name=etcd-2
+      - --data-dir=/etcd-data
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://etcd-2:2379
+      - --listen-peer-urls=http://0.0.0.0:2380
+      - --initial-advertise-peer-urls=http://etcd-2:2380
+      - --initial-cluster=etcd-1=http://etcd:2380,etcd-2=http://etcd-2:2380,etcd-3=http://etcd-3:2380
+      - --initial-cluster-state=new
+    volumes:
+      - etcd_2_data:/etcd-data
+    expose: ["2379", "2380"]
+    restart: unless-stopped
+    stop_grace_period: 35s
+    mem_limit: 1g
+    cpus: 2.0
+    healthcheck:
+      test: ["CMD", "etcdctl", "--endpoints=http://127.0.0.1:2379", "endpoint", "health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 15s
+
+  etcd-3:
+    image: quay.io/coreos/etcd:v3.5.15
+    command:
+      - etcd
+      - --name=etcd-3
+      - --data-dir=/etcd-data
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://etcd-3:2379
+      - --listen-peer-urls=http://0.0.0.0:2380
+      - --initial-advertise-peer-urls=http://etcd-3:2380
+      - --initial-cluster=etcd-1=http://etcd:2380,etcd-2=http://etcd-2:2380,etcd-3=http://etcd-3:2380
+      - --initial-cluster-state=new
+    volumes:
+      - etcd_3_data:/etcd-data
+    expose: ["2379", "2380"]
+    restart: unless-stopped
+    stop_grace_period: 35s
+    mem_limit: 1g
+    cpus: 2.0
+    healthcheck:
+      test: ["CMD", "etcdctl", "--endpoints=http://127.0.0.1:2379", "endpoint", "health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 15s
+
+  apisix:
+    depends_on:
+      etcd:
+        condition: service_healthy
+      etcd-2:
+        condition: service_healthy
+      etcd-3:
+        condition: service_healthy
+    environment:
+      SAG_APISIX_ADMIN_API_KEY: ${SAG_APISIX_ADMIN_API_KEY:?APISIX Admin key is required}
+    volumes:
+      - ./infra/apisix/config-ha.yaml:/usr/local/apisix/conf/config.yaml:ro
+
+  apisix-2:
+    image: apache/apisix:3.10.0-debian
+    depends_on:
+      etcd:
+        condition: service_healthy
+      etcd-2:
+        condition: service_healthy
+      etcd-3:
+        condition: service_healthy
+    environment:
+      SAG_APISIX_ADMIN_API_KEY: ${SAG_APISIX_ADMIN_API_KEY:?APISIX Admin key is required}
+    expose: ["9080", "9180", "9092"]
+    volumes:
+      - ./infra/apisix/config-ha.yaml:/usr/local/apisix/conf/config.yaml:ro
+    restart: unless-stopped
+    stop_grace_period: 35s
+    mem_limit: 1g
+    cpus: 2.0
+    healthcheck:
+      test: ["CMD", "apisix", "status"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+
+  apisix-lb:
+    image: nginx:1.27-alpine
+    depends_on:
+      apisix:
+        condition: service_healthy
+      apisix-2:
+        condition: service_healthy
+    volumes:
+      - ./infra/nginx/apisix-lb.conf:/etc/nginx/conf.d/default.conf:ro
+    expose: ["9080", "9092"]
+    restart: unless-stopped
+    stop_grace_period: 35s
+    mem_limit: 512m
+    cpus: 1.0
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:9092/v1/healthcheck"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+  sag-connector:
+    command: ["/workspace/target/release/sag-connector"]
+    stop_grace_period: 35s
+    environment:
+      SAG_TUNNEL_ENDPOINTS: ${SAG_TUNNEL_ENDPOINTS:?both Agent tunnel endpoints are required}
+      SAG_APISIX_BASE_URL: http://apisix-lb:9080
+      SAG_APISIX_READINESS_URL: http://apisix-lb:9092/v1/healthcheck
+      SAG_GRPC_TLS_SERVER_NAME: ${SAG_GRPC_TLS_SERVER_NAME:?Agent TLS server name is required}
+      SAG_GRPC_TLS_CLIENT_CERT: ${SAG_GRPC_TLS_CLIENT_CERT:?Connector client certificate path is required}
+      SAG_GRPC_TLS_CLIENT_KEY: ${SAG_GRPC_TLS_CLIENT_KEY:?Connector client key path is required}
+      SAG_GRPC_TLS_CA: ${SAG_GRPC_TLS_CA:?Agent CA path is required}
+
+volumes:
+  etcd_2_data:
+  etcd_3_data:

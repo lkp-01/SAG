@@ -1,0 +1,22 @@
+[package]
+name = "sag-policy"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde_json.workspace = true
+axum.workspace = true
+moka.workspace = true
+serde.workspace = true
+jsonwebtoken.workspace = true
+shared_storage = { path = "../../shared/storage" }
+sag-service-health = { path = "../../shared/service-health" }
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tower-http.workspace = true
+metrics.workspace = true
+metrics-exporter-prometheus.workspace = true
+redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
+uuid.workspace = true

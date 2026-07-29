@@ -1,0 +1,52 @@
+# Release overrides: run Rust services from pre-built binaries under /workspace/target/release
+# (build once inside the toolchain container so binaries land on the shared target_cache volume).
+#
+# === One command — full stack (Linux) ===
+#
+#   cd ~/workspace/sag-cloud
+#   docker compose -f docker-compose.yml -f docker-compose.release.yml up -d --build
+#
+# === Dual-host production (recommended) ===
+#
+# Edge (192.168.8.87):
+#   docker-compose -f docker-compose.edge.yml run --rm control-plane-admin \
+#     cargo build --workspace --release
+#   docker-compose -f docker-compose.edge.yml -f docker-compose.release.edge.yml up -d --build
+#
+# Intra (192.168.9.26):
+#   docker compose -f docker-compose.intra.yml run --rm sag-connector \
+#     cargo build --workspace --release
+#   docker compose -f docker-compose.intra.yml -f docker-compose.release.yml up -d --build
+#
+# === If the main admin UI (:3001) is missing ===
+#
+#   docker compose -f docker-compose.yml -f docker-compose.release.yml up -d --build frontend-admin-next
+#   docker logs -f sag-frontend-admin-next
+#
+# === Entry URLs (replace host) ===
+#
+#   Admin (Next.js):  http://<host>:3001
+#   Legacy Vite admin: http://<host>:5173   (optional)
+#   User portal:      http://<host>:5174
+#
+services:
+  control-plane-admin:
+    command: ["/workspace/target/release/control-plane-admin"]
+
+  sag-auth:
+    command: ["/workspace/target/release/sag-auth"]
+
+  sag-policy:
+    command: ["/workspace/target/release/sag-policy"]
+
+  stealth-tunnel-agent:
+    command: ["/workspace/target/release/stealth-tunnel-agent"]
+
+  sag-connector:
+    command: ["/workspace/target/release/sag-connector"]
+
+  http-tunnel-bridge:
+    command: ["/workspace/target/release/http-tunnel-bridge"]
+
+  zentinel:
+    command: ["/workspace/proxy/core/target/release/zentinel", "--config", "/workspace/proxy/zentinel-proxy/config/dataplane-compose.kdl"]

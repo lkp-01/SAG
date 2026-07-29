@@ -1,0 +1,20 @@
+[
+  {
+    "username": "alice",
+    "employeeNumber": "alice",
+    "name": "Alice 技术",
+    "dept": "研发"
+  },
+  {
+    "username": "bob",
+    "employeeNumber": "bob",
+    "name": "Bob 运维",
+    "dept": "运维"
+  },
+  {
+    "username": "boss",
+    "employeeNumber": "boss",
+    "name": "Boss 总经理",
+    "dept": "管理层"
+  }
+]

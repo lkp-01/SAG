@@ -1,0 +1,630 @@
+x-service-defaults: &service-defaults
+  restart: unless-stopped
+  stop_grace_period: 35s
+  mem_limit: 1g
+  cpus: 2.0
+
+services:
+  # Edge host (internet-facing / ZTNA plane) over VPN+DNS
+
+  postgres:
+    <<: *service-defaults
+    image: postgres:16
+    container_name: sag-postgres
+    environment:
+      POSTGRES_DB: sag
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d sag"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+
+  redis:
+    <<: *service-defaults
+    image: redis:7-alpine
+    container_name: sag-redis
+    environment:
+      # Development-only single-node password. Release overrides require an operator secret.
+      REDIS_PASSWORD: ${SAG_REDIS_PASSWORD:-dev-only-change-me}
+    command:
+      - sh
+      - -ec
+      - |
+        test -n "$${REDIS_PASSWORD}"
+        printf 'appendonly yes\nappendfsync everysec\nrequirepass %s\n' "$${REDIS_PASSWORD}" > /tmp/sag-redis.conf
+        exec redis-server /tmp/sag-redis.conf
+    expose:
+      - "6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "REDISCLI_AUTH=\"$${REDIS_PASSWORD}\" redis-cli --no-auth-warning ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    restart: unless-stopped
+
+  fake-4a:
+    <<: *service-defaults
+    image: python:3.11-slim
+    container_name: sag-fake-4a
+    working_dir: /workspace/infra/fake-4a
+    command: ["python", "mock_4a_server.py"]
+    volumes:
+      - ./:/workspace
+    environment:
+      FAKE_4A_PORT: "19080"
+      FAKE_4A_CLIENT_ID: sag-local-client
+      FAKE_4A_CLIENT_SECRET: sag-local-secret
+      FAKE_4A_USERS_FILE: /workspace/infra/fake-4a/users.json
+      FAKE_4A_AUDIT_LIMIT: "500"
+      FAKE_4A_PORTAL_URL: http://${SAG_PUBLIC_HOST:-192.168.8.87}:3001/app
+      FAKE_4A_LOGIN_URL: http://${SAG_PUBLIC_HOST:-192.168.8.87}:3001/login
+    ports:
+      - "19080:19080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; s=socket.create_connection(('127.0.0.1',19080),2); s.close()"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+  control-plane-admin:
+    <<: *service-defaults
+    build:
+      context: .
+      dockerfile: ./infra/docker/rust-toolchain.Dockerfile
+    image: sag-rust-toolchain:1.94
+    container_name: sag-control-plane-admin
+    working_dir: /workspace
+    command: ["cargo", "run", "-p", "control-plane-admin", "--bin", "control-plane-admin"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./:/workspace
+      - cargo_registry:/usr/local/cargo/registry
+      - cargo_git:/usr/local/cargo/git
+      - target_cache:/workspace/target
+    environment:
+      SAG_DOCKER_COMPOSE: "1"
+      SAG_STORAGE_BACKEND: ${SAG_STORAGE_BACKEND:-postgres}
+      SAG_POSTGRES_DSN: ${SAG_POSTGRES_DSN:-postgres://postgres:postgres@postgres:5432/sag}
+      SAG_JWT_SECRET: ${SAG_JWT_SECRET:-dev-jwt-secret}
+      SAG_PUBLIC_READONLY_TOKEN: ${SAG_PUBLIC_READONLY_TOKEN:-demo-readonly-token}
+      SAG_AGENT_SYNC_TOKEN: ${SAG_AGENT_SYNC_TOKEN:-sag-agent-sync-dev-token}
+      SAG_BOOTSTRAP_DEMO_TUNNEL_ROUTE: "true"
+      # Reconcile APISIX on intra host via VPN/DNS.
+      SAG_APISIX_ADMIN_BASE_URL: ${SAG_APISIX_ADMIN_BASE_URL:-http://192.168.9.26:9180}
+      SAG_APISIX_ADMIN_API_KEY: ${SAG_APISIX_ADMIN_API_KEY:-your-admin-key}
+      SAG_APISIX_RECONCILE_ENABLED: ${SAG_APISIX_RECONCILE_ENABLED:-true}
+      SAG_APISIX_RECONCILE_INTERVAL_SEC: ${SAG_APISIX_RECONCILE_INTERVAL_SEC:-30}
+    ports:
+      - "8090:8090"
+    healthcheck:
+      test: ["CMD-SHELL", "bash -ec 'exec 3<>/dev/tcp/127.0.0.1/8090; printf \"GET /ready HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n\" >&3; head -n 1 <&3 | grep -q \" 200 \"'"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 30s
+
+  sag-auth:
+    <<: *service-defaults
+    build:
+      context: .
+      dockerfile: ./infra/docker/rust-toolchain.Dockerfile
+    image: sag-rust-toolchain:1.94
+    container_name: sag-auth
+    working_dir: /workspace
+    command: ["cargo", "run", "-p", "sag-auth"]
+    depends_on:
+      fake-4a:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./:/workspace
+      - cargo_registry:/usr/local/cargo/registry
+      - cargo_git:/usr/local/cargo/git
+      - target_cache:/workspace/target
+    environment:
+      SAG_DOCKER_COMPOSE: "1"
+      SAG_STORAGE_BACKEND: ${SAG_STORAGE_BACKEND:-postgres}
+      SAG_POSTGRES_DSN: ${SAG_POSTGRES_DSN:-postgres://postgres:postgres@postgres:5432/sag}
+      SAG_JWT_SECRET: ${SAG_JWT_SECRET:-dev-jwt-secret}
+      SAG_BOOTSTRAP_ADMIN_PASSWORD: ${SAG_BOOTSTRAP_ADMIN_PASSWORD:-Admin@123}
+      # Used by login memo cache + SSO OAuth state cache (prevents auth crash under high QPS / multi-instance).
+      SAG_SESSION_REDIS_URL: ${SAG_SESSION_REDIS_URL:-redis://:dev-only-change-me@redis:6379/0}
+      # Increase login memo cache TTL/capacity to reduce hot-login burst CPU load.
+      SAG_LOGIN_MEMO_TTL_SEC: ${SAG_LOGIN_MEMO_TTL_SEC:-600}
+      SAG_LOGIN_MEMO_MAX_CAPACITY: ${SAG_LOGIN_MEMO_MAX_CAPACITY:-500000}
+      SAG_PUBLIC_BASE_URL: http://${SAG_PUBLIC_HOST:-192.168.8.87}:8080
+      SAG_FOURA_REDIRECT_URI: http://${SAG_PUBLIC_HOST:-192.168.8.87}:3001/api-auth/api/v1/auth/sso/callback
+      SAG_FOURA_FIRST_URI: http://fake-4a:19080/oauth/authorize
+      SAG_FOURA_SECOND_URI: http://fake-4a:19080/oauth/token
+      SAG_FOURA_THIRD_URI: http://fake-4a:19080/oauth/userinfo
+      SAG_FOURA_CLIENT_ID: sag-local-client
+      SAG_FOURA_CLIENT_SECRET: sag-local-secret
+      SAG_FOURA_DEFAULT_ROLES: user
+      SAG_FOURA_ROLE_MAP: boss:boss;alice:tech;bob:ops
+      SAG_SSO_PORTAL_REDIRECT_URL: http://${SAG_PUBLIC_HOST:-192.168.8.87}:3001/app
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "bash -ec 'exec 3<>/dev/tcp/127.0.0.1/8080; printf \"GET /ready HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n\" >&3; head -n 1 <&3 | grep -q \" 200 \"'"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 30s
+
+  sag-policy:
+    <<: *service-defaults
+    build:
+      context: .
+      dockerfile: ./infra/docker/rust-toolchain.Dockerfile
+    image: sag-rust-toolchain:1.94
+    container_name: sag-policy
+    working_dir: /workspace
+    command: ["cargo", "run", "-p", "sag-policy"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./:/workspace
+      - cargo_registry:/usr/local/cargo/registry
+      - cargo_git:/usr/local/cargo/git
+      - target_cache:/workspace/target
+    environment:
+      SAG_DOCKER_COMPOSE: "1"
+      SAG_STORAGE_BACKEND: ${SAG_STORAGE_BACKEND:-postgres}
+      SAG_POSTGRES_DSN: ${SAG_POSTGRES_DSN:-postgres://postgres:postgres@postgres:5432/sag}
+      SAG_JWT_SECRET: ${SAG_JWT_SECRET:-dev-jwt-secret}
+      SAG_POLICY_INTERNAL_TOKEN: ${SAG_POLICY_INTERNAL_TOKEN:-dev-policy-internal-token}
+      SAG_POLICY_CACHE_TTL_SEC: ${SAG_POLICY_CACHE_TTL_SEC:-30}
+      SAG_POLICY_CACHE_MAX_CAPACITY: ${SAG_POLICY_CACHE_MAX_CAPACITY:-200000}
+      SAG_POLICY_CACHE_REDIS_URL: ${SAG_POLICY_CACHE_REDIS_URL:-redis://:dev-only-change-me@redis:6379/0}
+    ports:
+      - "8081:8081"
+    healthcheck:
+      test: ["CMD-SHELL", "bash -ec 'exec 3<>/dev/tcp/127.0.0.1/8081; printf \"GET /ready HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n\" >&3; head -n 1 <&3 | grep -q \" 200 \"'"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 30s
+
+  stealth-tunnel-agent:
+    <<: *service-defaults
+    build:
+      context: .
+      dockerfile: ./infra/docker/rust-toolchain.Dockerfile
+    image: sag-rust-toolchain:1.94
+    container_name: sag-stealth-agent
+    working_dir: /workspace
+    command: ["cargo", "run", "-p", "stealth-tunnel-agent"]
+    depends_on:
+      control-plane-admin:
+        condition: service_healthy
+      sag-policy:
+        condition: service_healthy
+    volumes:
+      - ./:/workspace
+      - cargo_registry:/usr/local/cargo/registry
+      - cargo_git:/usr/local/cargo/git
+      - target_cache:/workspace/target
+    environment:
+      SAG_DOCKER_COMPOSE: "1"
+      # Idempotency claims/results must be shared by every Agent replica.
+      SAG_STORAGE_BACKEND: ${SAG_STORAGE_BACKEND:-postgres}
+      SAG_POSTGRES_DSN: ${SAG_POSTGRES_DSN:-postgres://postgres:postgres@postgres:5432/sag}
+      SAG_IDEMPOTENCY_TTL_SEC: ${SAG_IDEMPOTENCY_TTL_SEC:-86400}
+      SAG_CONTROL_PLANE_SYNC_ENDPOINT: ${SAG_CONTROL_PLANE_SYNC_ENDPOINT:-http://control-plane-admin:8090/api/v1/agent/routes}
+      SAG_CONTROL_PLANE_SYNC_NO_LOCALHOST_FALLBACK: "true"
+      SAG_AGENT_SYNC_TOKEN: ${SAG_AGENT_SYNC_TOKEN:-sag-agent-sync-dev-token}
+      SAG_POLICY_EVALUATE_ENDPOINT: ${SAG_POLICY_EVALUATE_ENDPOINT:-http://sag-policy:8081/api/v1/policy/evaluate}
+      SAG_POLICY_EVALUATE_TIMEOUT_MS: ${SAG_POLICY_EVALUATE_TIMEOUT_MS:-5000}
+      SAG_POLICY_INTERNAL_TOKEN: ${SAG_POLICY_INTERNAL_TOKEN:-dev-policy-internal-token}
+      SAG_AUTH_VERIFY_ENDPOINT: ${SAG_AUTH_VERIFY_ENDPOINT:-http://sag-auth:8080/api/v1/auth/verify}
+      SAG_AUTH_VERIFY_TIMEOUT_MS: ${SAG_AUTH_VERIFY_TIMEOUT_MS:-5000}
+      SAG_POLICY_INFLIGHT_LIMIT: ${SAG_POLICY_INFLIGHT_LIMIT:-256}
+      SAG_AUTH_INFLIGHT_LIMIT: ${SAG_AUTH_INFLIGHT_LIMIT:-256}
+      SAG_METRICS_LISTEN_ADDR: ${SAG_METRICS_LISTEN_ADDR:-0.0.0.0:9104}
+      SAG_HEALTH_LISTEN_ADDR: ${SAG_AGENT_HEALTH_LISTEN_ADDR:-0.0.0.0:9105}
+      SAG_AGENT_MIN_CONNECTOR_SESSIONS: ${SAG_AGENT_MIN_CONNECTOR_SESSIONS:-1}
+      SAG_AGENT_STREAM_BUFFER: ${SAG_AGENT_STREAM_BUFFER:-128}
+      SAG_AGENT_MAX_REQUEST_BODY_BYTES: ${SAG_AGENT_MAX_REQUEST_BODY_BYTES:-1048576}
+      SAG_AGENT_MAX_RESPONSE_BODY_BYTES: ${SAG_AGENT_MAX_RESPONSE_BODY_BYTES:-1048576}
+      SAG_MEMORY_BUDGET_BYTES: ${SAG_AGENT_MEMORY_BUDGET_BYTES:-805306368}
+      # Connector lease: heartbeat defaults to 2s on Intra, expire after five misses.
+      SAG_TUNNEL_HEALTHY_WINDOW_SEC: ${SAG_TUNNEL_HEALTHY_WINDOW_SEC:-10}
+      SAG_GRPC_KEEPALIVE_MS: ${SAG_GRPC_KEEPALIVE_MS:-5000}
+      SAG_GRPC_KEEPALIVE_TIMEOUT_MS: ${SAG_GRPC_KEEPALIVE_TIMEOUT_MS:-5000}
+      # Production mTLS material must be supplied from the Edge host's local-only .env.
+      SAG_GRPC_MTLS_ENABLED: ${SAG_GRPC_MTLS_ENABLED:-true}
+      SAG_GRPC_TLS_CERT: ${SAG_GRPC_TLS_CERT:-}
+      SAG_GRPC_TLS_KEY: ${SAG_GRPC_TLS_KEY:-}
+      SAG_GRPC_TLS_CLIENT_CA: ${SAG_GRPC_TLS_CLIENT_CA:-}
+      SAG_REQUIRE_CONNECTOR_CERT_BINDING: ${SAG_REQUIRE_CONNECTOR_CERT_BINDING:-true}
+      SAG_CONNECTOR_CERT_BINDINGS: ${SAG_CONNECTOR_CERT_BINDINGS:-}
+      # Wait for connector forward: > SAG_CONNECTOR_HTTP_TIMEOUT_MS (~55s), < bridge SAG_GRPC_RPC_TIMEOUT_MS / forward.
+      SAG_FORWARD_TIMEOUT_MS: ${SAG_FORWARD_TIMEOUT_MS:-58000}
+      SAG_MAX_PENDING_WAITERS: ${SAG_MAX_PENDING_WAITERS:-128}
+    # High concurrent dataplane: avoid axum accept() EMFILE (Too many open files) under k6.
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
+    restart: unless-stopped
+    ports:
+      # Must be reachable from intra host over VPN
+      - "50051:50051"
+      # Prometheus-style metrics (SAG_METRICS_LISTEN_ADDR); optional on host for curl/debug
+      - "9104:9104"
+      - "9105:9105"
+    healthcheck:
+      test: ["CMD-SHELL", "bash -ec 'exec 3<>/dev/tcp/127.0.0.1/9105; printf \"GET /ready HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n\" >&3; head -n 1 <&3 | grep -q \" 200 \"'"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 30s
+
+  http-tunnel-bridge:
+    <<: *service-defaults
+    build:
+      context: .
+      dockerfile: ./infra/docker/rust-toolchain.Dockerfile
+    image: sag-rust-toolchain:1.94
+    # No container_name: allows `docker compose up --scale http-tunnel-bridge=N` (see docker-compose.hscale-edge.yml).
+    working_dir: /workspace
+    command: ["cargo", "run", "-p", "http-tunnel-bridge"]
+    depends_on:
+      stealth-tunnel-agent:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./:/workspace
+      - cargo_registry:/usr/local/cargo/registry
+      - cargo_git:/usr/local/cargo/git
+      - target_cache:/workspace/target
+    environment:
+      SAG_DOCKER_COMPOSE: "1"
+      SAG_BRIDGE_INSTANCE_ID: ${SAG_BRIDGE_INSTANCE_ID:-edge-bridge-1}
+      SAG_TUNNEL_GRPC_ENDPOINT: ${SAG_TUNNEL_GRPC_ENDPOINT:-https://stealth-tunnel-agent:50051}
+      SAG_GRPC_TLS_SERVER_NAME: ${SAG_GRPC_TLS_SERVER_NAME:-localhost}
+      SAG_GRPC_MTLS_ENABLED: ${SAG_GRPC_MTLS_ENABLED:-true}
+      SAG_GRPC_TLS_CLIENT_CERT: ${SAG_GRPC_TLS_CLIENT_CERT:-}
+      SAG_GRPC_TLS_CLIENT_KEY: ${SAG_GRPC_TLS_CLIENT_KEY:-}
+      SAG_GRPC_TLS_CA: ${SAG_GRPC_TLS_CA:-}
+      SAG_GRPC_KEEPALIVE_MS: ${SAG_GRPC_KEEPALIVE_MS:-5000}
+      SAG_GRPC_KEEPALIVE_TIMEOUT_MS: ${SAG_GRPC_KEEPALIVE_TIMEOUT_MS:-5000}
+      SAG_GRPC_TCP_KEEPALIVE_MS: ${SAG_GRPC_TCP_KEEPALIVE_MS:-5000}
+      # §4 ladder: connector_http(55s) < agent_forward(58s) < bridge_forward(60s) <= grpc_rpc(120s); k6/Zentinel >= 90s — see docs/ops/timeout-deadline-runbook.md
+      SAG_BRIDGE_FORWARD_TIMEOUT_MS: ${SAG_BRIDGE_FORWARD_TIMEOUT_MS:-60000}
+      SAG_GRPC_CONNECT_TIMEOUT_MS: ${SAG_GRPC_CONNECT_TIMEOUT_MS:-5000}
+      # Per-RPC deadline on the tonic Channel (must be >= SAG_BRIDGE_FORWARD_TIMEOUT_MS or unary forward is cut early).
+      SAG_GRPC_RPC_TIMEOUT_MS: ${SAG_GRPC_RPC_TIMEOUT_MS:-120000}
+      # Development uses authenticated single-node Redis DB /2. Production must provide TLS plus managed HA or Sentinel endpoints.
+      SAG_BRIDGE_REDIS_URL: ${SAG_BRIDGE_REDIS_URL:-redis://:dev-only-change-me@redis:6379/2}
+      SAG_BRIDGE_REDIS_SENTINELS: ${SAG_BRIDGE_REDIS_SENTINELS:-}
+      SAG_BRIDGE_REDIS_SENTINEL_SERVICE: ${SAG_BRIDGE_REDIS_SENTINEL_SERVICE:-}
+      SAG_BRIDGE_REDIS_CONNECT_TIMEOUT_MS: ${SAG_BRIDGE_REDIS_CONNECT_TIMEOUT_MS:-2000}
+      SAG_BRIDGE_REDIS_COMMAND_TIMEOUT_MS: ${SAG_BRIDGE_REDIS_COMMAND_TIMEOUT_MS:-5000}
+      SAG_BRIDGE_REDIS_RECONNECT_RETRIES: ${SAG_BRIDGE_REDIS_RECONNECT_RETRIES:-6}
+      SAG_BRIDGE_REDIS_RECONNECT_BASE_MS: ${SAG_BRIDGE_REDIS_RECONNECT_BASE_MS:-100}
+      SAG_BRIDGE_REDIS_RECONNECT_MAX_MS: ${SAG_BRIDGE_REDIS_RECONNECT_MAX_MS:-2000}
+      # Dependency failure is 503. Only read-only requests may opt into synchronous fallback explicitly.
+      SAG_BRIDGE_READ_ONLY_SYNC_FALLBACK_ON_QUEUE_ERROR: ${SAG_BRIDGE_READ_ONLY_SYNC_FALLBACK_ON_QUEUE_ERROR:-false}
+      # Above soft: enqueue 202 (Redis). Lower = earlier async queue (needs clients/k6 to poll /__sag/queue/.../status).
+      SAG_BRIDGE_SOFT_INFLIGHT: ${SAG_BRIDGE_SOFT_INFLIGHT:-24}
+      SAG_BRIDGE_HARD_INFLIGHT: ${SAG_BRIDGE_HARD_INFLIGHT:-128}
+      # Max concurrent unary Forward RPCs (HTTP try + workers block). 0 = disable gate in binary.
+      SAG_BRIDGE_MAX_TUNNEL_INFLIGHT: ${SAG_BRIDGE_MAX_TUNNEL_INFLIGHT:-128}
+      SAG_BRIDGE_QUEUE_MAX_LEN: ${SAG_BRIDGE_QUEUE_MAX_LEN:-20000}
+      SAG_BRIDGE_QUEUE_MAX_BODY_BYTES: ${SAG_BRIDGE_QUEUE_MAX_BODY_BYTES:-262144}
+      SAG_BRIDGE_QUEUE_TTL_SEC: ${SAG_BRIDGE_QUEUE_TTL_SEC:-600}
+      # Shared semaphore caps concurrent worker forwards (was 4 → queue drained too slowly vs enqueue).
+      SAG_BRIDGE_WORKER_CONCURRENCY: ${SAG_BRIDGE_WORKER_CONCURRENCY:-16}
+      SAG_BRIDGE_QUEUE_MAX_RESULT_BODY_BYTES: ${SAG_BRIDGE_QUEUE_MAX_RESULT_BODY_BYTES:-65536}
+      SAG_BRIDGE_MAX_RESPONSE_BODY_BYTES: ${SAG_BRIDGE_MAX_RESPONSE_BODY_BYTES:-1048576}
+      SAG_MEMORY_BUDGET_BYTES: ${SAG_BRIDGE_MEMORY_BUDGET_BYTES:-536870912}
+      SAG_BRIDGE_POLL_MIN_INTERVAL_MS: ${SAG_BRIDGE_POLL_MIN_INTERVAL_MS:-100}
+      SAG_BRIDGE_DEDUP_TTL_SEC: ${SAG_BRIDGE_DEDUP_TTL_SEC:-600}
+      SAG_BRIDGE_QUEUE_RECLAIM_IDLE_MS: ${SAG_BRIDGE_QUEUE_RECLAIM_IDLE_MS:-70000}
+      SAG_BRIDGE_QUEUE_RECLAIM_JITTER_MARGIN_MS: ${SAG_BRIDGE_QUEUE_RECLAIM_JITTER_MARGIN_MS:-5000}
+      SAG_BRIDGE_QUEUE_MAX_ATTEMPTS: ${SAG_BRIDGE_QUEUE_MAX_ATTEMPTS:-3}
+      # Unary Forward connections to stealth-tunnel-agent (1=legacy single channel; 2–8 splits HTTP/2 load).
+      SAG_BRIDGE_GRPC_CHANNEL_POOL_SIZE: ${SAG_BRIDGE_GRPC_CHANNEL_POOL_SIZE:-1}
+      # Per x-sag-app-id token-bucket RPS on dataplane HTTP (before body read). 0 = disabled (default).
+      # SAG_BRIDGE_HTTP_RPS_PER_APP: ${SAG_BRIDGE_HTTP_RPS_PER_APP:-0}
+      # Consecutive Unary Forward failures before opening cool-off; each logical request has exactly one gRPC attempt. 0 = disabled (default).
+      # SAG_BRIDGE_FORWARD_CB_FAILURE_THRESHOLD: ${SAG_BRIDGE_FORWARD_CB_FAILURE_THRESHOLD:-0}
+      # Cool-off window when forward circuit is open (ms).
+      # SAG_BRIDGE_FORWARD_CB_COOL_OFF_MS: ${SAG_BRIDGE_FORWARD_CB_COOL_OFF_MS:-10000}
+    # Match stealth-tunnel-agent: bridge accepts many parallel Zentinel->HTTP sessions.
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
+    expose:
+      - "9000"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "bash -ec 'exec 3<>/dev/tcp/127.0.0.1/9000; printf \"GET /ready HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n\" >&3; head -n 1 <&3 | grep -q \" 200 \"'"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 30s
+
+  zentinel:
+    <<: *service-defaults
+    build:
+      context: .
+      dockerfile: ./infra/docker/rust-toolchain.Dockerfile
+    image: sag-rust-toolchain:1.94
+    container_name: sag-zentinel
+    working_dir: /workspace
+    command:
+      [
+        "cargo",
+        "run",
+        "--manifest-path",
+        "/workspace/proxy/core/Cargo.toml",
+        "-p",
+        "zentinel-proxy",
+        "--bin",
+        "zentinel",
+        "--",
+        "--config",
+        "/workspace/proxy/zentinel-proxy/config/dataplane-compose.kdl"
+      ]
+    depends_on:
+      http-tunnel-bridge:
+        condition: service_healthy
+    environment:
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+    volumes:
+      - ./:/workspace
+      - cargo_registry:/usr/local/cargo/registry
+      - cargo_git:/usr/local/cargo/git
+      - target_cache:/workspace/target
+      - ./infra/docker/zentinel-gitconfig:/root/.gitconfig:ro
+    ports:
+      - "10080:10080"
+    networks:
+      default:
+        ipv4_address: 172.19.0.250
+    healthcheck:
+      test: ["CMD-SHELL", "bash -ec 'echo > /dev/tcp/127.0.0.1/10080'"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 20s
+
+  company-demo-sites:
+    <<: *service-defaults
+    image: python:3.11-slim
+    container_name: sag-company-demo-sites
+    working_dir: /app
+    command: ["python", "server.py"]
+    volumes:
+      - ./infra/demo-sites:/app
+    ports:
+      - "28080:28080"
+    environment:
+      DEMO_SITES_ADDR: "0.0.0.0"
+      DEMO_SITES_PORT: "28080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; s=socket.create_connection(('127.0.0.1',28080),2); s.close()"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+  frontend-admin:
+    <<: *service-defaults
+    profiles: ["legacy"]
+    image: node:20
+    container_name: sag-frontend-admin
+    working_dir: /workspace/frontend
+    command: ["sh", "-c", "npm install && npm run dev -- --host 0.0.0.0 --port 5173"]
+    depends_on:
+      - control-plane-admin
+      - sag-auth
+      - sag-policy
+    volumes:
+      - ./:/workspace
+      - frontend_admin_node_modules:/workspace/frontend/node_modules
+    environment:
+      VITE_CONTROL_PROXY_TARGET: ${VITE_CONTROL_PROXY_TARGET:-http://control-plane-admin:8090}
+      VITE_AUTH_PROXY_TARGET: ${VITE_AUTH_PROXY_TARGET:-http://sag-auth:8080}
+      VITE_POLICY_PROXY_TARGET: ${VITE_POLICY_PROXY_TARGET:-http://sag-policy:8081}
+      VITE_BRIDGE_PROXY_TARGET: ${VITE_BRIDGE_PROXY_TARGET:-http://http-tunnel-bridge:9000}
+      VITE_ZENTINEL_PROXY_TARGET: ${VITE_ZENTINEL_PROXY_TARGET:-https://zentinel:10080}
+    ports:
+      - "5173:5173"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:5173/').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 30s
+
+  frontend-admin-next:
+    <<: *service-defaults
+    image: node:20
+    container_name: sag-frontend-admin-next
+    working_dir: /workspace/frontend-admin-next
+    command:
+      [
+        "sh",
+        "-c",
+        "npm ci --include=dev && npm run build && NODE_ENV=production npm run start -- --hostname 0.0.0.0 --port 3001"
+      ]
+    depends_on:
+      - control-plane-admin
+      - sag-auth
+      - sag-policy
+      - zentinel
+    volumes:
+      - ./:/workspace
+      - frontend_admin_next_node_modules:/workspace/frontend-admin-next/node_modules
+    extra_hosts:
+      - "example.com:172.19.0.250"
+    environment:
+      CONTROL_PROXY_TARGET: ${CONTROL_PROXY_TARGET:-http://control-plane-admin:8090}
+      AUTH_PROXY_TARGET: ${AUTH_PROXY_TARGET:-http://sag-auth:8080}
+      POLICY_PROXY_TARGET: ${POLICY_PROXY_TARGET:-http://sag-policy:8081}
+      BRIDGE_PROXY_TARGET: ${BRIDGE_PROXY_TARGET:-http://http-tunnel-bridge:9000}
+      # Match TLS cert SANs (example.com / localhost / 127.0.0.1).
+      ZENTINEL_PROXY_TARGET: ${ZENTINEL_PROXY_TARGET:-https://example.com:10080}
+      PROM_PROXY_TARGET: ${PROM_PROXY_TARGET:-http://prometheus:9090}
+      GRAFANA_PROXY_TARGET: ${GRAFANA_PROXY_TARGET:-http://grafana:3000}
+      NEXT_PUBLIC_GRAFANA_URL: ${NEXT_PUBLIC_GRAFANA_URL:-http://192.168.8.87:3000}
+      NEXT_PUBLIC_PROMETHEUS_URL: ${NEXT_PUBLIC_PROMETHEUS_URL:-http://192.168.8.87:9091}
+      NEXT_PUBLIC_REFRESH_MS: ${NEXT_PUBLIC_REFRESH_MS:-10000}
+      NODE_EXTRA_CA_CERTS: /workspace/infra/tls/ca.crt
+      npm_config_cache: /workspace/.npm-cache
+      npm_config_audit: "false"
+      npm_config_fund: "false"
+    ports:
+      - "3001:3001"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3001/').then(r=>{if(r.status>=500)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 60s
+
+  frontend-portal:
+    <<: *service-defaults
+    profiles: ["legacy"]
+    image: node:20
+    container_name: sag-frontend-portal
+    working_dir: /workspace/frontend-portal
+    command: ["sh", "-c", "npm install && npm run dev -- --host 0.0.0.0 --port 5174"]
+    depends_on:
+      - sag-auth
+      - sag-policy
+      - zentinel
+      - company-demo-sites
+    volumes:
+      - ./:/workspace
+      - frontend_portal_node_modules:/workspace/frontend-portal/node_modules
+    environment:
+      VITE_CONTROL_PROXY_TARGET: ${VITE_CONTROL_PROXY_TARGET:-http://control-plane-admin:8090}
+      VITE_AUTH_PROXY_TARGET: ${VITE_AUTH_PROXY_TARGET:-http://sag-auth:8080}
+      VITE_POLICY_PROXY_TARGET: ${VITE_POLICY_PROXY_TARGET:-http://sag-policy:8081}
+      VITE_ZENTINEL_PROXY_TARGET: ${VITE_ZENTINEL_PROXY_TARGET:-https://zentinel:10080}
+      VITE_DEMO_SITES_BASE: ${VITE_DEMO_SITES_BASE:-http://127.0.0.1:28080}
+      VITE_ADMIN_PLANE_URL: ${VITE_ADMIN_PLANE_URL:-http://127.0.0.1:5173}
+    expose:
+      - "5174"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:5174/').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 30s
+
+  otel-collector:
+    <<: *service-defaults
+    image: otel/opentelemetry-collector-contrib:latest
+    container_name: sag-otel-collector
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./infra/observability/otel-collector.yaml:/etc/otelcol/config.yaml:ro
+    ports:
+      - "4317:4317"
+      - "4318:4318"
+      - "9464:9464"
+    healthcheck:
+      test: ["CMD", "/otelcol-contrib", "components"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  prometheus:
+    <<: *service-defaults
+    image: prom/prometheus:v2.55.0
+    container_name: sag-prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+    volumes:
+      - ./infra/observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./infra/observability/alerts:/etc/prometheus/alerts:ro
+    ports:
+      - "9091:9090"
+    depends_on:
+      - control-plane-admin
+      - sag-auth
+      - sag-policy
+      - node-exporter
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:9090/-/ready"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+  grafana:
+    <<: *service-defaults
+    image: grafana/grafana:11.2.0
+    container_name: sag-grafana
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: sag-admin
+      GF_METRICS_ENABLED: "true"
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:3000/api/health | grep -q ok"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 20s
+
+  node-exporter:
+    <<: *service-defaults
+    image: quay.io/prometheus/node-exporter:v1.9.0
+    container_name: sag-node-exporter
+    ports:
+      - "9100:9100"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:9100/metrics"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+volumes:
+  postgres_data:
+  redis_data:
+  cargo_registry:
+  cargo_git:
+  target_cache:
+  frontend_admin_node_modules:
+  frontend_admin_next_node_modules:
+  frontend_portal_node_modules:
+
+networks:
+  default:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.19.0.0/16
+          gateway: 172.19.0.1

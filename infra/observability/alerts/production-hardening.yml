@@ -1,0 +1,80 @@
+groups:
+  - name: sag-production-hardening
+    interval: 30s
+    rules:
+      - alert: ReadyReplicaInsufficient
+        expr: (sum(service_ready{job=~"http-tunnel-bridge|stealth-tunnel-agent|sag-auth|sag-policy"}) by (job) or on() vector(0)) < 2
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "A production service has fewer than two ready replicas"
+
+      - alert: PostgresPoolWaitHigh
+        expr: (sum(rate(db_pool_wait_seconds_sum[5m])) / clamp_min(sum(rate(db_pool_wait_seconds_count[5m])), 1)) > 0.25
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "PostgreSQL pool acquisition wait exceeds 250 ms"
+
+      - alert: AuditDropDetected
+        expr: sum(increase(audit_dropped_total[5m])) > 0
+        for: 0m
+        labels: { severity: critical }
+        annotations:
+          summary: "At least one audit record was dropped"
+
+      - alert: RedisPelOldestAgeHigh
+        expr: max(bridge_queue_pel_oldest_age_seconds) > 120
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "The oldest Redis pending queue delivery exceeds two minutes"
+
+      - alert: DeadLetterQueueGrowing
+        expr: sum(increase(bridge_queue_dlq_total[10m])) > 0
+        for: 0m
+        labels: { severity: warning }
+        annotations:
+          summary: "Bridge dead-letter queue is growing"
+
+      - alert: QueueSaturationHigh
+        expr: sum(rate(bridge_queue_reject_total{reason="queue_full"}[5m])) > 0.1
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "Bridge queue is rejecting work due to saturation"
+
+      - alert: AgentWithoutConnector
+        expr: max by (instance) (agent_connector_sessions) < 1
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: "An Agent has no acknowledged Connector session"
+
+      - alert: RouteSyncStale
+        expr: max by (instance) (agent_route_sync_age_seconds) > 120
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "Agent route synchronization is stale"
+
+      - alert: AuthInvalidationLagHigh
+        expr: max(auth_cache_staleness_seconds) > 30 or sum(increase(auth_invalidation_failed_total[5m])) > 0
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "Auth revocation propagation is outside its SLO"
+
+      - alert: IndeterminateIdempotencyTooOld
+        expr: max(idempotency_oldest_indeterminate_age_seconds) > 900
+        for: 5m
+        labels: { severity: critical }
+        annotations:
+          summary: "An indeterminate mutation needs operator reconciliation"
+
+      - alert: ServiceRestartLoop
+        expr: changes(up{job=~"http-tunnel-bridge|stealth-tunnel-agent|sag-auth|sag-policy|sag-connector|apisix"}[10m]) > 4
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "A production target is repeatedly disappearing and returning"

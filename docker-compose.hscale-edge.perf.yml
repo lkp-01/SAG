@@ -1,0 +1,16 @@
+# CPU affinity for optional second bridge (use with docker-compose.hscale-edge.yml).
+# Example:
+#   docker compose -f docker-compose.edge.yml -f docker-compose.release.edge.yml \
+#     -f docker-compose.hscale-edge.yml -f docker-compose.edge.perf.yml \
+#     -f docker-compose.hscale-edge.perf.yml --env-file scripts/ops/cpuset-dualhost.env up -d
+
+services:
+  http-tunnel-bridge-2:
+    cpuset: "${SAG_EDGE_CPUSET_BRIDGE_2:-6}"
+    cpu_shares: 2048
+    mem_limit: 3g
+    pids_limit: 2048
+
+  # When hscale kdl is active, zentinel fans out to two bridges — give it dedicated cores.
+  zentinel:
+    cpuset: "${SAG_EDGE_CPUSET_ZENTINEL_HSCALE:-7}"

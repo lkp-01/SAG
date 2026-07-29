@@ -1,0 +1,39 @@
+apisix:
+  node_listen: 9080
+  enable_admin: true
+  enable_admin_cors: false
+  enable_control: true
+  control:
+    ip: 0.0.0.0
+    port: 9092
+
+plugins:
+  - prometheus
+  - proxy-rewrite
+
+plugin_attr:
+  prometheus:
+    export_uri: /apisix/prometheus/metrics
+    export_addr:
+      ip: 0.0.0.0
+      port: 9091
+
+deployment:
+  role: traditional
+  role_traditional:
+    config_provider: etcd
+  admin:
+    allow_admin:
+      - 127.0.0.0/24
+      - 172.16.0.0/12
+    admin_key:
+      - name: admin
+        key: ${{SAG_APISIX_ADMIN_API_KEY}}
+        role: admin
+  etcd:
+    host:
+      - "http://etcd:2379"
+      - "http://etcd-2:2379"
+      - "http://etcd-3:2379"
+    prefix: "/apisix"
+    timeout: 30

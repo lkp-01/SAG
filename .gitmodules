@@ -1,0 +1,4 @@
+[submodule "proxy/core"]
+	path = proxy/core
+	url = https://github.com/swaggyz7/Secure_Access_Gateway_SAG.git
+	branch = vendor/proxy-core

@@ -1,0 +1,43 @@
+﻿# dependencies
+node_modules/
+**/node_modules/
+
+# rust/cargo build artifacts
+target/
+**/target/
+
+# frontend build/cache
+.next/
+dist/
+build/
+
+# npm cache (accidental workspace cache)
+.npm-cache/
+
+# python cache
+__pycache__/
+**/__pycache__/
+*.pyc
+
+# logs and temp
+*.log
+!artifacts/**/*.log
+*.tmp
+*.cache
+
+# environment
+.env
+.env.*
+!.env.example
+!.env.dev.example
+!.env.dualhost.example
+.secrets/
+
+# editor/system
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# PPT exports (source of truth: docs/ai_instruction/*.marp.md)
+docs/ai_instruction/*.pptx

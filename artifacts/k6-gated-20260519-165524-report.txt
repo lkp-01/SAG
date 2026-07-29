@@ -1,0 +1,5 @@
+﻿SAG gated dataplane run: 20260519-165524
+EdgeHost=172.16.9.107  AppId=app-001
+FirstRps=1000  SecondRps=1500  threshold=0.9  cooldown=300s
+Success mode: apisix_routed  VUs: pre=2000 max=10000  tier=2m x4
+tier 1000 exit=0 dataplane_get_success_rate= json=D:\lxz\compile\Rust_project\Secure_Access_Gateway_SAG\sag-cloud\artifacts\k6-gated-20260519-165524-dp-1000.json

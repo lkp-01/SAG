@@ -1,0 +1,31 @@
+# CPU affinity + FD limits for sag-auth horizontal scale (pair with cpuset-edge-28.env).
+# High-QPS login needs nofile >> default 1024; without it axum logs EMFILE and k6 sees 499/EOF.
+services:
+  sag-auth:
+    cpuset: "${SAG_EDGE_CPUSET_AUTH:-2}"
+    cpu_shares: 1536
+    mem_limit: 2g
+    pids_limit: 4096
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
+
+  sag-auth-2:
+    cpuset: "${SAG_EDGE_CPUSET_AUTH_2:-3}"
+    cpu_shares: 1536
+    mem_limit: 2g
+    pids_limit: 4096
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
+
+  sag-auth-lb:
+    cpuset: "${SAG_EDGE_CPUSET_AUTH_LB:-26}"
+    cpu_shares: 512
+    mem_limit: 256m
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576

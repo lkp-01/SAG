@@ -1,0 +1,37 @@
+# Intra host CPU affinity (Gzh / mock + APISIX + connector).
+# Example:
+#   docker compose -f docker-compose.intra.yml -f docker-compose.release.intra.yml \
+#     -f docker-compose.intra.perf.yml --env-file scripts/ops/cpuset-dualhost.env up -d
+
+services:
+  etcd:
+    cpuset: "${SAG_INTRA_CPUSET_ETCD:-0}"
+    cpu_shares: 256
+    mem_limit: 512m
+
+  apisix:
+    cpuset: "${SAG_INTRA_CPUSET_APISIX:-1-2}"
+    cpu_shares: 2048
+    mem_limit: 2g
+
+  mock-workload:
+    cpuset: "${SAG_INTRA_CPUSET_MOCK:-1}"
+    cpu_shares: 1024
+    mem_limit: 1g
+    pids_limit: 512
+
+  company-demo-sites:
+    cpuset: "${SAG_INTRA_CPUSET_DEMO:-0}"
+    cpu_shares: 128
+    mem_limit: 256m
+
+  sag-connector:
+    cpuset: "${SAG_INTRA_CPUSET_CONNECTOR:-3}"
+    cpu_shares: 3072
+    mem_limit: 4g
+    pids_limit: 4096
+
+  metrics-gateway:
+    cpuset: "${SAG_INTRA_CPUSET_OBS:-0}"
+    cpu_shares: 64
+    mem_limit: 128m

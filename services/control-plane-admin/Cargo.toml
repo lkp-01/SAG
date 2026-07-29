@@ -1,0 +1,25 @@
+[package]
+name = "control-plane-admin"
+version.workspace = true
+edition.workspace = true
+default-run = "control-plane-admin"
+
+[dependencies]
+anyhow.workspace = true
+uuid.workspace = true
+axum.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+jsonwebtoken.workspace = true
+moka.workspace = true
+shared_storage = { path = "../../shared/storage" }
+sag-service-health = { path = "../../shared/service-health" }
+tokio.workspace = true
+tokio-postgres.workspace = true
+rusqlite.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tower-http.workspace = true
+metrics.workspace = true
+metrics-exporter-prometheus.workspace = true

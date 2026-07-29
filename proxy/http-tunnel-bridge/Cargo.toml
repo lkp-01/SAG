@@ -1,0 +1,32 @@
+[package]
+name = "http-tunnel-bridge"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+bytes.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sag-tunnel-proto = { path = "../../shared/tunnel-proto" }
+tokio.workspace = true
+tonic.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
+tokio-rustls.workspace = true
+metrics.workspace = true
+metrics-exporter-prometheus.workspace = true
+shared_storage = { path = "../../shared/storage" }
+sag-service-health = { path = "../../shared/service-health" }
+sag-runtime-budget = { path = "../../shared/runtime-budget" }
+redis = { version = "0.27", features = ["tokio-rustls-comp", "connection-manager", "sentinel"] }
+base64 = "0.22"
+dashmap = "6.1"

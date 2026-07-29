@@ -1,0 +1,110 @@
+# Edge CPU affinity + cgroup limits. Pair with scripts/ops/cpuset-dualhost.env (see .example).
+#
+#   docker compose -f docker-compose.edge.yml -f docker-compose.release.edge.yml \
+#     -f docker-compose.edge.perf.yml --env-file scripts/ops/cpuset-dualhost.env up -d
+#
+# Horizontal scale: only http-tunnel-bridge is meant for `--scale` or hscale-edge.yml.
+# `--scale http-tunnel-bridge=2` pins BOTH replicas to SAG_EDGE_CPUSET_BRIDGE (same CPUs).
+
+services:
+  # Single-edge performance override for docker-compose v1:
+  # - Keep cpuset configurable (string field)
+  # - Use fixed numeric values for cpu_shares / mem_limit / pids_limit so old compose
+  #   does not coerce interpolated values into strings and reject the config
+
+  postgres:
+    cpuset: "${SAG_EDGE_CPUSET_POSTGRES:-0}"
+    cpu_shares: 768
+    mem_limit: 2g
+
+  redis:
+    cpuset: "${SAG_EDGE_CPUSET_REDIS:-0}"
+    cpu_shares: 1024
+    mem_limit: 1g
+
+  control-plane-admin:
+    cpuset: "${SAG_EDGE_CPUSET_CONTROL:-1}"
+    cpu_shares: 768
+    mem_limit: 2g
+    pids_limit: 512
+
+  sag-auth:
+    cpuset: "${SAG_EDGE_CPUSET_AUTH:-1}"
+    cpu_shares: 1536
+    mem_limit: 2g
+    pids_limit: 512
+
+  sag-policy:
+    cpuset: "${SAG_EDGE_CPUSET_POLICY:-2-3}"
+    cpu_shares: 2048
+    mem_limit: 4g
+    pids_limit: 1024
+    environment:
+      SAG_POLICY_CACHE_TTL_SEC: ${SAG_POLICY_CACHE_TTL_SEC:-60}
+      SAG_POLICY_CACHE_MAX_CAPACITY: ${SAG_POLICY_CACHE_MAX_CAPACITY:-500000}
+
+  stealth-tunnel-agent:
+    cpuset: "${SAG_EDGE_CPUSET_STEALTH:-4}"
+    cpu_shares: 1536
+    mem_limit: 2g
+    pids_limit: 1024
+    environment:
+      SAG_FORWARD_TIMEOUT_MS: ${SAG_FORWARD_TIMEOUT_MS:-58000}
+      # Increase connector pending queue + stream buffer to reduce forwarding timeouts.
+      SAG_MAX_PENDING_WAITERS: ${SAG_MAX_PENDING_WAITERS:-60000}
+      SAG_AGENT_STREAM_BUFFER: ${SAG_AGENT_STREAM_BUFFER:-8192}
+      SAG_POLICY_EVALUATE_TIMEOUT_MS: ${SAG_POLICY_EVALUATE_TIMEOUT_MS:-5000}
+      SAG_AUTH_VERIFY_TIMEOUT_MS: ${SAG_AUTH_VERIFY_TIMEOUT_MS:-3000}
+      # Suppress 940/1000 dataplane bulkhead 403 by allowing more concurrent policy misses.
+      SAG_POLICY_INFLIGHT_LIMIT: ${SAG_POLICY_INFLIGHT_LIMIT:-8192}
+      SAG_AUTH_INFLIGHT_LIMIT: ${SAG_AUTH_INFLIGHT_LIMIT:-1024}
+      # Increase policy decision cache TTL to raise hit rate under load.
+      SAG_POLICY_DECISION_CACHE_TTL_SEC: ${SAG_POLICY_DECISION_CACHE_TTL_SEC:-300}
+
+  http-tunnel-bridge:
+    cpuset: "${SAG_EDGE_CPUSET_BRIDGE:-5}"
+    cpu_shares: 2048
+    mem_limit: 3g
+    pids_limit: 2048
+    environment:
+      SAG_BRIDGE_FORWARD_TIMEOUT_MS: ${SAG_BRIDGE_FORWARD_TIMEOUT_MS:-60000}
+      SAG_GRPC_KEEPALIVE_MS: ${SAG_GRPC_KEEPALIVE_MS:-15000}
+      SAG_GRPC_TCP_KEEPALIVE_MS: ${SAG_GRPC_TCP_KEEPALIVE_MS:-15000}
+      SAG_GRPC_CONNECT_TIMEOUT_MS: ${SAG_GRPC_CONNECT_TIMEOUT_MS:-5000}
+      SAG_GRPC_RPC_TIMEOUT_MS: ${SAG_GRPC_RPC_TIMEOUT_MS:-120000}
+
+  zentinel:
+    cpuset: "${SAG_EDGE_CPUSET_ZENTINEL:-6-7}"
+    cpu_shares: 3072
+    mem_limit: 4g
+    pids_limit: 2048
+
+  frontend-admin-next:
+    cpuset: "${SAG_EDGE_CPUSET_FRONTEND:-0}"
+    cpu_shares: 128
+    mem_limit: 1g
+
+  fake-4a:
+    cpuset: "${SAG_EDGE_CPUSET_SSO:-0}"
+    cpu_shares: 64
+    mem_limit: 256m
+
+  prometheus:
+    cpuset: "${SAG_EDGE_CPUSET_OBS:-0}"
+    cpu_shares: 64
+    mem_limit: 1g
+
+  grafana:
+    cpuset: "${SAG_EDGE_CPUSET_OBS:-0}"
+    cpu_shares: 64
+    mem_limit: 512m
+
+  node-exporter:
+    cpuset: "${SAG_EDGE_CPUSET_OBS:-0}"
+    cpu_shares: 32
+    mem_limit: 128m
+
+  otel-collector:
+    cpuset: "${SAG_EDGE_CPUSET_OBS:-0}"
+    cpu_shares: 64
+    mem_limit: 256m

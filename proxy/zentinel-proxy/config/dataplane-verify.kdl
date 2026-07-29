@@ -1,0 +1,52 @@
+// Minimal Zentinel config: HTTPS :10080 -> http-tunnel-bridge :9000 (Windows host from WSL).
+// Run from proxy/core: cargo run -p zentinel-proxy --bin zentinel -- --config ../zentinel-proxy/config/dataplane-verify.kdl
+// Tune bridge-upstream target if bridge listens elsewhere.
+
+system {
+    worker-threads 0
+}
+
+listeners {
+    listener "https-dataplane" {
+        address "0.0.0.0:10080"
+        protocol "https"
+        request-timeout-secs 120
+        tls {
+            cert-file "tests/fixtures/tls/server-default.crt"
+            key-file "tests/fixtures/tls/server-default.key"
+            min-version "TLS1.2"
+        }
+    }
+}
+
+routes {
+    route "dataplane-api" {
+        matches {
+            path-prefix "/"
+        }
+        upstream "bridge-upstream"
+        policies {
+            timeout-secs 90
+            failure-mode "closed"
+        }
+    }
+}
+
+upstreams {
+    upstream "bridge-upstream" {
+        target "127.0.0.1:9000" weight=1
+        load-balancing "round_robin"
+    }
+}
+
+limits {
+    max-header-size-bytes 16384
+    max-body-size-bytes 10485760
+}
+
+observability {
+    logging {
+        level "info"
+        format "text"
+    }
+}

@@ -1,0 +1,16 @@
+﻿SAG tiered dataplane run id: 20260509-101839
+threshold: success_rate >= 0.8 -> run 900
+DATAPLANE_URL=https://192.168.8.87:10080/dev/
+2026-05-09 10:18:39Z
+
+---- tier 700 ----
+dataplane_get success_rate: 0.428087278687405
+
+SKIP 900: 0.428087278687405 < 0.8
+
+---- 闂瀹氫綅绾跨储 ----
+403/forbidden -> policy/auth/agent grpc_server
+503/policy -> sag-policy overload, agent policy HTTP timeout
+502/gateway -> bridge/connector/poll failed
+timeout/status 0 -> deadline chain bridge/agent/connector
+202 澶?-> bridge 闃熷垪涓?SOFT_INFLIGHT / worker

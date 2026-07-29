@@ -1,0 +1,3 @@
+# WSL/bash breaks on CRLF; keep shell scripts Unix LF even on Windows checkouts
+*.sh text eol=lf
+scripts/start-zentinel-wsl text eol=lf

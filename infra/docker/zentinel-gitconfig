@@ -1,0 +1,10 @@
+# Mounted as /root/.gitconfig in the `zentinel` service (and used when Cargo fetches git deps).
+#
+# Do NOT point github.com at gitclone.com by default: that mirror often returns 502 and breaks
+# `pingora` (and other) git dependencies during `cargo build`.
+#
+# If GitHub is unreachable from your network, replace this file or set a working mirror, e.g.:
+#   [url "https://YOUR_INTERNAL_OR_PUBLIC_MIRROR/github.com/"]
+#       insteadOf = https://github.com/
+#
+# See also: DEPLOYMENT_README_FRESH_UBUNTU.md (optional mirror examples).

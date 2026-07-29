@@ -1,0 +1,58 @@
+system {
+    worker-threads 0
+}
+
+listeners {
+    listener "https-dataplane" {
+        address "0.0.0.0:10080"
+        protocol "https"
+        request-timeout-secs 120
+        tls {
+            cert-file "/workspace/infra/tls/server-default.crt"
+            key-file "/workspace/infra/tls/server-default.key"
+            min-version "TLS1.2"
+        }
+    }
+
+    listener "metrics" {
+        address "0.0.0.0:9090"
+        protocol "http"
+        request-timeout-secs 30
+    }
+}
+
+routes {
+    route "dataplane-api" {
+        matches { path-prefix "/" }
+        upstream "bridge-upstream"
+        policies {
+            timeout-secs 90
+            failure-mode "closed"
+        }
+    }
+}
+
+upstreams {
+    upstream "bridge-upstream" {
+        target "http-tunnel-bridge:9000" weight=1
+        target "http-tunnel-bridge-2:9000" weight=1
+        load-balancing "round_robin"
+    }
+}
+
+limits {
+    max-header-size-bytes 16384
+    max-body-size-bytes 10485760
+}
+
+observability {
+    metrics {
+        enabled #true
+        address "0.0.0.0:9090"
+        path "/metrics"
+    }
+    logging {
+        level "info"
+        format "text"
+    }
+}

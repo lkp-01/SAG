@@ -1,0 +1,4 @@
+SAG gated dataplane run id: 20260513-092552
+gate: success_rate >= 0.9 @ 500 iter/s -> run 700
+DATAPLANE_URL=https://172.16.9.107:10080/dev/
+2026-05-13 09:25:52Z

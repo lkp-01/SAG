@@ -1,0 +1,4 @@
+# Used when building from /workspace (docker compose `working_dir: /workspace`).
+# Makes Cargo use the `git` CLI for git dependencies so ~/.gitconfig `url.*.insteadOf` applies.
+[net]
+git-fetch-with-cli = true

@@ -1,0 +1,17 @@
+[package]
+name = "shared_storage"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+deadpool-postgres = "0.14.1"
+metrics.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10"
+thiserror.workspace = true
+tokio.workspace = true
+tokio-postgres.workspace = true
+uuid.workspace = true
