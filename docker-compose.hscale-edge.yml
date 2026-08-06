@@ -28,6 +28,8 @@ x-agent-security-environment: &agent-security-environment
   SAG_POSTGRES_DSN: ${SAG_POSTGRES_DSN:?PostgreSQL DSN is required}
   SAG_AGENT_SYNC_TOKEN: ${SAG_AGENT_SYNC_TOKEN:?Agent sync token is required}
   SAG_POLICY_INTERNAL_TOKEN: ${SAG_POLICY_INTERNAL_TOKEN:?Policy internal token is required}
+  SAG_CONTROL_PLANE_SYNC_MAX_BODY_BYTES: ${SAG_CONTROL_PLANE_SYNC_MAX_BODY_BYTES:-4194304}
+  SAG_CONTROL_PLANE_SYNC_MAX_ROUTES: ${SAG_CONTROL_PLANE_SYNC_MAX_ROUTES:-10000}
   SAG_GRPC_MTLS_ENABLED: "true"
   SAG_GRPC_TLS_CERT: ${SAG_GRPC_TLS_CERT:?Agent server certificate path is required}
   SAG_GRPC_TLS_KEY: ${SAG_GRPC_TLS_KEY:?Agent server key path is required}
@@ -44,7 +46,7 @@ services:
 
   stealth-tunnel-agent:
     environment:
-      SAG_AGENT_INSTANCE_ID: edge-agent-1
+      SAG_AGENT_INSTANCE_ID: ${SAG_AGENT_INSTANCE_ID:-edge-agent-1}
 
   http-tunnel-bridge-2:
     <<: *ha-runtime
@@ -114,7 +116,7 @@ services:
     environment:
       <<: *agent-security-environment
       SAG_DOCKER_COMPOSE: "1"
-      SAG_AGENT_INSTANCE_ID: edge-agent-2
+      SAG_AGENT_INSTANCE_ID: ${SAG_AGENT_INSTANCE_ID_2:-edge-agent-2}
       SAG_CONTROL_PLANE_SYNC_ENDPOINT: ${SAG_CONTROL_PLANE_SYNC_ENDPOINT:-http://control-plane-admin:8090/api/v1/agent/routes}
       SAG_CONTROL_PLANE_SYNC_NO_LOCALHOST_FALLBACK: "true"
       SAG_POLICY_EVALUATE_ENDPOINT: ${SAG_POLICY_EVALUATE_ENDPOINT:-http://sag-policy-lb:8081/api/v1/policy/evaluate}

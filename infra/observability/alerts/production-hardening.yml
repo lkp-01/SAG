@@ -51,12 +51,61 @@ groups:
         annotations:
           summary: "An Agent has no acknowledged Connector session"
 
+      - alert: AgentConnectorProbeTransportFailure
+        expr: sum by (instance) (increase(agent_connector_probe_total{result="timeout"}[5m])) >= 3 or sum by (instance) (increase(agent_connector_probe_total{result="send_failed"}[5m])) > 0
+        for: 0m
+        labels: { severity: warning }
+        annotations:
+          summary: "Connector real-path probes are timing out or cannot be sent"
+
+      - alert: AgentConnectorProbeRevoked
+        expr: sum by (instance, reason) (increase(agent_connector_session_revoked_total{reason=~"probe_timeout_threshold|probe_send_failed"}[5m])) > 0
+        for: 0m
+        labels: { severity: critical }
+        annotations:
+          summary: "An Agent revoked a Connector after a real-path probe failure"
+
+      - alert: AgentConnectorProbeAckRejected
+        expr: sum by (instance) (increase(agent_connector_probe_ack_rejected_total[5m])) > 0
+        for: 0m
+        labels: { severity: warning }
+        annotations:
+          summary: "A late or generation-mismatched Connector probe ACK was rejected"
+
       - alert: RouteSyncStale
         expr: max by (instance) (agent_route_sync_age_seconds) > 120
         for: 2m
         labels: { severity: critical }
         annotations:
           summary: "Agent route synchronization is stale"
+
+      - alert: AgentConfigGenerationLag
+        expr: (max by (agent_id) (agent_config_generation_lag) > 0) and on (agent_id) (max by (agent_id) (agent_config_ack_active) == 1)
+        for: 2m
+        labels: { severity: warning }
+        annotations:
+          summary: "An Agent has not acknowledged the current route generation"
+
+      - alert: ConfigSyncJobFailing
+        expr: sum(increase(config_sync_jobs_total{status=~"failed|outcome_unknown"}[5m])) > 0
+        for: 0m
+        labels: { severity: warning }
+        annotations:
+          summary: "A persistent APISIX configuration job failed or has an unknown outcome and is retrying"
+
+      - alert: ApisixManagedRouteDrift
+        expr: max(apisix_managed_route_drift) > 0
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "APISIX managed routes differ from control-plane desired state"
+
+      - alert: ApisixReconcileStale
+        expr: time() - apisix_reconcile_last_success_timestamp_seconds > 120
+        for: 2m
+        labels: { severity: warning }
+        annotations:
+          summary: "APISIX reconciliation has not completed successfully"
 
       - alert: AuthInvalidationLagHigh
         expr: max(auth_cache_staleness_seconds) > 30 or sum(increase(auth_invalidation_failed_total[5m])) > 0

@@ -8,7 +8,7 @@ CREATE TABLE IF NOT EXISTS tunnel_routes (
 CREATE TABLE IF NOT EXISTS intranet_upstreams (
   app_id TEXT PRIMARY KEY,
   upstream TEXT NOT NULL,
-  scheme TEXT NOT NULL DEFAULT ''http''
+  scheme TEXT NOT NULL DEFAULT 'http'
 );
 
 CREATE TABLE IF NOT EXISTS policies (

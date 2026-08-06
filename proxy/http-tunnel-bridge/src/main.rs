@@ -159,6 +159,9 @@ fn validate_bridge_memory_budget(
 #[derive(Debug)]
 pub enum BridgeForwardError {
     Tunnel(String),
+    /// The Agent is reachable, but no usable Connector session is available.
+    /// This is an availability failure (HTTP 503), not an upstream bad gateway.
+    Unavailable(String),
     DeadlineExceeded(String),
     OutcomeUnknown {
         detail: String,
@@ -174,6 +177,7 @@ impl fmt::Display for BridgeForwardError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             BridgeForwardError::Tunnel(s) => write!(f, "{s}"),
+            BridgeForwardError::Unavailable(s) => write!(f, "{s}"),
             BridgeForwardError::DeadlineExceeded(s) => write!(f, "{s}"),
             BridgeForwardError::OutcomeUnknown { detail, .. } => write!(f, "{detail}"),
             BridgeForwardError::InflightSaturated => write!(f, "tunnel concurrent limit saturated"),
@@ -679,6 +683,10 @@ async fn forward_request_inner(
                 })
             } else if deadline_exceeded {
                 Err(BridgeForwardError::DeadlineExceeded(detail))
+            } else if reconnect {
+                Err(BridgeForwardError::Unavailable(format!(
+                    "connector unavailable: {detail}"
+                )))
             } else {
                 Err(BridgeForwardError::Tunnel(format!(
                     "tunnel forward failed: {detail}"
@@ -1148,6 +1156,9 @@ async fn proxy(
                 Err(BridgeForwardError::Tunnel(msg)) => {
                     return Err((axum::http::StatusCode::BAD_GATEWAY, msg));
                 }
+                Err(BridgeForwardError::Unavailable(msg)) => {
+                    return Err((axum::http::StatusCode::SERVICE_UNAVAILABLE, msg));
+                }
                 Err(BridgeForwardError::DeadlineExceeded(msg)) => {
                     return Err((axum::http::StatusCode::GATEWAY_TIMEOUT, msg));
                 }
@@ -1168,6 +1179,9 @@ async fn proxy(
         }
         Err(BridgeForwardError::Tunnel(msg)) => {
             return Err((axum::http::StatusCode::BAD_GATEWAY, msg));
+        }
+        Err(BridgeForwardError::Unavailable(msg)) => {
+            return Err((axum::http::StatusCode::SERVICE_UNAVAILABLE, msg));
         }
         Err(BridgeForwardError::DeadlineExceeded(msg)) => {
             return Err((axum::http::StatusCode::GATEWAY_TIMEOUT, msg));

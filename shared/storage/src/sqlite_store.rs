@@ -49,6 +49,87 @@ impl SqliteStore {
                     upstream TEXT NOT NULL,
                     scheme TEXT NOT NULL DEFAULT 'http'
                 );
+                CREATE TABLE IF NOT EXISTS config_state (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    generation INTEGER NOT NULL DEFAULT 0 CHECK (generation >= 0),
+                    updated_at_ms INTEGER NOT NULL DEFAULT 0 CHECK (updated_at_ms >= 0)
+                );
+                INSERT INTO config_state (id, generation, updated_at_ms)
+                VALUES (1, 0, 0)
+                ON CONFLICT(id) DO NOTHING;
+                CREATE TABLE IF NOT EXISTS agent_config_applies (
+                    agent_id TEXT PRIMARY KEY CHECK (length(agent_id) > 0),
+                    applied_generation INTEGER NOT NULL CHECK (applied_generation >= 0),
+                    snapshot_hash TEXT CHECK (
+                        snapshot_hash IS NULL OR (
+                            length(snapshot_hash) = 64
+                            AND snapshot_hash NOT GLOB '*[^0-9a-f]*'
+                        )
+                    ),
+                    applied_at_ms INTEGER NOT NULL CHECK (applied_at_ms >= 0),
+                    reported_at_ms INTEGER NOT NULL CHECK (reported_at_ms >= 0)
+                );
+                CREATE INDEX IF NOT EXISTS idx_agent_config_applies_generation
+                    ON agent_config_applies(applied_generation, reported_at_ms);
+                CREATE INDEX IF NOT EXISTS idx_agent_config_applies_reported
+                    ON agent_config_applies(reported_at_ms);
+                CREATE TABLE IF NOT EXISTS config_sync_jobs (
+                    job_id TEXT PRIMARY KEY CHECK (length(job_id) > 0),
+                    generation INTEGER NOT NULL CHECK (generation >= 0),
+                    target TEXT NOT NULL CHECK (length(target) > 0),
+                    resource_type TEXT NOT NULL CHECK (length(resource_type) > 0),
+                    resource_id TEXT NOT NULL CHECK (length(resource_id) > 0),
+                    app_id TEXT NOT NULL CHECK (length(app_id) > 0),
+                    operation TEXT NOT NULL CHECK (operation IN ('UPSERT', 'DELETE')),
+                    payload_json TEXT,
+                    status TEXT NOT NULL DEFAULT 'PENDING'
+                        CHECK (status IN ('PENDING', 'APPLIED', 'FAILED')),
+                    attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+                    next_attempt_at_ms INTEGER NOT NULL DEFAULT 0 CHECK (next_attempt_at_ms >= 0),
+                    last_error TEXT,
+                    lease_owner TEXT,
+                    lease_expires_at_ms INTEGER,
+                    superseded_by_generation INTEGER,
+                    created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+                    updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms >= 0),
+                    applied_at_ms INTEGER,
+                    CHECK (
+                        (lease_owner IS NULL AND lease_expires_at_ms IS NULL)
+                        OR (lease_owner IS NOT NULL AND length(lease_owner) > 0 AND lease_expires_at_ms IS NOT NULL)
+                    ),
+                    CHECK (
+                        superseded_by_generation IS NULL OR superseded_by_generation > generation
+                    ),
+                    CHECK (applied_at_ms IS NULL OR applied_at_ms >= 0)
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS uq_config_sync_jobs_resource_generation
+                    ON config_sync_jobs(target, resource_type, resource_id, generation);
+                UPDATE config_sync_jobs
+                SET superseded_by_generation = (
+                    SELECT MAX(newer.generation)
+                    FROM config_sync_jobs AS newer
+                    WHERE newer.target = config_sync_jobs.target
+                      AND newer.resource_type = config_sync_jobs.resource_type
+                      AND newer.resource_id = config_sync_jobs.resource_id
+                      AND newer.generation > config_sync_jobs.generation
+                )
+                WHERE superseded_by_generation IS NULL
+                  AND EXISTS (
+                    SELECT 1
+                    FROM config_sync_jobs AS newer
+                    WHERE newer.target = config_sync_jobs.target
+                      AND newer.resource_type = config_sync_jobs.resource_type
+                      AND newer.resource_id = config_sync_jobs.resource_id
+                      AND newer.generation > config_sync_jobs.generation
+                  );
+                CREATE UNIQUE INDEX IF NOT EXISTS uq_config_sync_jobs_current_resource
+                    ON config_sync_jobs(target, resource_type, resource_id)
+                    WHERE superseded_by_generation IS NULL;
+                CREATE INDEX IF NOT EXISTS idx_config_sync_jobs_due
+                    ON config_sync_jobs(next_attempt_at_ms, generation, created_at_ms)
+                    WHERE status IN ('PENDING', 'FAILED') AND superseded_by_generation IS NULL;
+                CREATE INDEX IF NOT EXISTS idx_config_sync_jobs_resource
+                    ON config_sync_jobs(target, resource_type, resource_id, generation DESC);
                 CREATE TABLE IF NOT EXISTS policies (
                     id TEXT PRIMARY KEY,
                     effect TEXT NOT NULL,
@@ -200,6 +281,26 @@ impl SqliteStore {
                     ON idempotency_reconciliation_events(scope_key, created_at_ms);
                 ",
             )?;
+            let has_agent_snapshot_hash = {
+                let mut statement = conn.prepare("PRAGMA table_info(agent_config_applies)")?;
+                let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+                let mut found = false;
+                for column in columns {
+                    if column? == "snapshot_hash" {
+                        found = true;
+                    }
+                }
+                found
+            };
+            if !has_agent_snapshot_hash {
+                conn.execute(
+                    "ALTER TABLE agent_config_applies ADD COLUMN snapshot_hash TEXT \
+                     CHECK (snapshot_hash IS NULL OR ( \
+                       length(snapshot_hash) = 64 \
+                       AND snapshot_hash NOT GLOB '*[^0-9a-f]*'))",
+                    [],
+                )?;
+            }
             let mut has_display_name = false;
             let mut has_title = false;
             let mut has_auth_version = false;

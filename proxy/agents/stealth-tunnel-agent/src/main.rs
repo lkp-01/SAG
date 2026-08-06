@@ -16,14 +16,14 @@ use grpc_server::StealthTunnelGrpcService;
 use moka::future::Cache;
 use sag_service_health::Readiness;
 use sag_tunnel_proto::tunnel_service_server::TunnelServiceServer;
-use shared_storage::{build_store_from_env, ensure_store_schema, AuditWriter};
+use shared_storage::{build_store_from_env, ensure_store_schema, AuditWriter, ConfigSyncStore};
 use tokio::sync::{RwLock, Semaphore};
 use tonic::transport::{Identity, Server, ServerTlsConfig};
 use tracing::{info, warn};
 
 use crate::config::StealthTunnelConfig;
-use crate::connector_registry::ConnectorRegistry;
-use crate::manager::{sync_routes_loop, TunnelManager};
+use crate::connector_registry::{ConnectorRegistry, ProbeOutcome, ProbePolicy};
+use crate::manager::{agent_instance_id, sync_routes_loop, TunnelManager};
 
 #[derive(Clone)]
 struct AgentHealthState {
@@ -31,6 +31,8 @@ struct AgentHealthState {
     manager: TunnelManager,
     connector_registry: ConnectorRegistry,
     minimum_connector_sessions: usize,
+    tunnel_healthy_window: std::time::Duration,
+    max_route_sync_age: std::time::Duration,
 }
 
 async fn live() -> StatusCode {
@@ -48,10 +50,14 @@ async fn ready(State(state): State<AgentHealthState>) -> StatusCode {
     let manager = state.manager.clone();
     let registry = state.connector_registry.clone();
     let minimum = state.minimum_connector_sessions;
+    let healthy_window = state.tunnel_healthy_window;
+    let max_route_sync_age = state.max_route_sync_age;
     let observed = state
         .readiness
         .probe(timeout, async move {
-            manager.initial_sync_succeeded() && registry.total_session_count() >= minimum
+            manager.initial_sync_succeeded()
+                && manager.route_sync_age_seconds() <= max_route_sync_age.as_secs_f64()
+                && registry.healthy_session_count(healthy_window) >= minimum
         })
         .await;
     if observed == sag_service_health::ReadyState::Ready {
@@ -121,6 +127,12 @@ async fn main() -> anyhow::Result<()> {
         max_response_body_bytes = cfg0.max_response_body_bytes,
         memory_required_bytes = cfg0.memory_required_bytes,
         memory_allowed_bytes = cfg0.memory_allowed_bytes,
+        connector_probe_enabled = cfg0.connector_probe_enabled,
+        connector_probe_interval_ms = cfg0.connector_probe_interval_ms,
+        connector_probe_timeout_ms = cfg0.connector_probe_timeout_ms,
+        connector_probe_freshness_ms = cfg0.connector_probe_freshness_ms,
+        connector_probe_startup_grace_ms = cfg0.connector_probe_startup_grace_ms,
+        connector_probe_failure_threshold = cfg0.connector_probe_failure_threshold,
         "stealth-tunnel-agent bounded data-plane memory budget enabled"
     );
     let listen: SocketAddr = cfg0.listen_addr.parse()?;
@@ -132,11 +144,19 @@ async fn main() -> anyhow::Result<()> {
 
     info!(
         ?sync_eps,
-        "control-plane route sync endpoints (order = try until success)"
+        "control-plane route sync endpoints (fetched concurrently; highest generation wins)"
     );
 
+    let probe_policy = ProbePolicy {
+        enabled: cfg0.connector_probe_enabled,
+        freshness: std::time::Duration::from_millis(cfg0.connector_probe_freshness_ms),
+        startup_grace: std::time::Duration::from_millis(cfg0.connector_probe_startup_grace_ms),
+        failure_threshold: cfg0.connector_probe_failure_threshold,
+    };
+    let probe_interval = std::time::Duration::from_millis(cfg0.connector_probe_interval_ms);
+    let probe_timeout = std::time::Duration::from_millis(cfg0.connector_probe_timeout_ms);
     let cfg = Arc::new(RwLock::new(cfg0));
-    let connector_registry = ConnectorRegistry::default();
+    let connector_registry = ConnectorRegistry::with_probe_policy(probe_policy);
     let reaper_registry = connector_registry.clone();
     let reaper_config = cfg.clone();
     tokio::spawn(async move {
@@ -157,6 +177,33 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     });
+    if probe_policy.enabled {
+        let probe_registry = connector_registry.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(probe_interval);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                let probes = probe_registry.probe_targets().into_iter().map(|target| {
+                    let registry = probe_registry.clone();
+                    async move {
+                        let outcome = registry.probe_session(target.clone(), probe_timeout).await;
+                        (target, outcome)
+                    }
+                });
+                for (target, outcome) in futures::future::join_all(probes).await {
+                    if outcome == ProbeOutcome::Revoked {
+                        warn!(
+                            endpoint = %target.endpoint,
+                            generation = target.generation,
+                            timeout_ms = probe_timeout.as_millis(),
+                            "Connector real-path health probe failed; session revoked"
+                        );
+                    }
+                }
+            }
+        });
+    }
 
     let manager = TunnelManager::new();
     let readiness = Readiness::new(
@@ -172,6 +219,33 @@ async fn main() -> anyhow::Result<()> {
 
     let store = build_store_from_env();
     ensure_store_schema(&store).await?;
+    let agent_id = agent_instance_id();
+    if let Some(previous_apply) = ConfigSyncStore::get_agent_apply(&store, &agent_id).await? {
+        if let Some(snapshot_hash) = previous_apply.snapshot_hash {
+            let generation = u64::try_from(previous_apply.applied_generation).map_err(|_| {
+                anyhow::anyhow!("persisted applied generation for Agent {agent_id} is negative")
+            })?;
+            manager
+                .restore_generation_floor(generation, snapshot_hash, previous_apply.applied_at_ms)
+                .await
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "restore persisted route generation fence for Agent {agent_id}: {error}"
+                    )
+                })?;
+            info!(
+                %agent_id,
+                applied_generation = generation,
+                "restored durable route generation fence; waiting for matching or newer snapshot"
+            );
+        } else {
+            warn!(
+                %agent_id,
+                applied_generation = previous_apply.applied_generation,
+                "legacy Agent ACK has no snapshot fingerprint; restart rollback fence starts after the next successful sync"
+            );
+        }
+    }
     let audit_writer = AuditWriter::from_env(store.clone())?;
     let svc = StealthTunnelGrpcService {
         manager,
@@ -223,6 +297,16 @@ async fn main() -> anyhow::Result<()> {
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(1),
+        tunnel_healthy_window: std::time::Duration::from_secs(
+            cfg.read().await.tunnel_healthy_window_sec.max(1),
+        ),
+        max_route_sync_age: std::time::Duration::from_secs(
+            std::env::var("SAG_AGENT_MAX_ROUTE_SYNC_AGE_SEC")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(60)
+                .clamp(5, 86_400),
+        ),
     };
     let health_listener = tokio::net::TcpListener::bind(health_addr).await?;
     let health_app = Router::new()

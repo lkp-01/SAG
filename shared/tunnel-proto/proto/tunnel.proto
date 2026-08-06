@@ -16,6 +16,8 @@ message TunnelMessage {
     CancelRequest cancel = 5;
     ConnectorRegisterAck register_ack = 6;
     ForwardAccepted accepted = 7;
+    HealthProbe health_probe = 8;
+    HealthProbeAck health_probe_ack = 9;
   }
 }
 
@@ -25,6 +27,9 @@ message ConnectorRegister {
   string external_host = 3;
   string endpoint = 4;
   string stream_epoch = 5;
+  // Additive feature negotiation keeps a probe-enabled Agent from sending a
+  // new frame type to an older Connector that would reject the stream.
+  repeated string capabilities = 6;
 }
 
 message ConnectorHeartbeat {
@@ -86,4 +91,18 @@ message ForwardAccepted {
   string request_id = 1;
   string attempt_id = 2;
   string stream_epoch = 3;
+}
+
+// A transport-only liveness check. It deliberately has its own message type so
+// it never enters the business request/idempotency path or an HTTP upstream.
+message HealthProbe {
+  string probe_id = 1;
+  string stream_epoch = 2;
+  int64 sent_unix_ms = 3;
+}
+
+message HealthProbeAck {
+  string probe_id = 1;
+  string stream_epoch = 2;
+  int64 received_unix_ms = 3;
 }

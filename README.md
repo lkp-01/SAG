@@ -223,6 +223,13 @@ APISIX 自带**嵌入在 Admin 端口上的 Web UI**（需 `deployment.admin.ena
 | **control-plane-admin** | `SAG_BOOTSTRAP_DEMO_TUNNEL_ROUTE` | `1`/`true` 时：若 **`tunnel_routes` 表为空** 则插入演示行（`app-001` / `connector-local-001:stream`），等同一次 HTTP `POST /api/v1/agent/routes`；表非空则不改 | （不设则关闭） |
 | **control-plane-admin** | `SAG_APISIX_ADMIN_BASE_URL` | APISIX Admin API 根 URL（**标准部署应配置**；不设置则不下发 APISIX） | `http://127.0.0.1:9180` |
 | **control-plane-admin** | `SAG_APISIX_ADMIN_API_KEY` | 请求头 `X-API-KEY`；**必须与 APISIX `config.yaml` 中 `admin_key.key` 一致** | （与 APISIX 配置相同） |
+| **control-plane-admin** | `SAG_CONFIG_SYNC_POLL_MS` / `SAG_CONFIG_SYNC_BATCH_SIZE` | 持久化 APISIX 同步任务的轮询间隔与单次租约批量；失败任务按指数退避重试 | `500` / `10` |
+| **control-plane-admin** | `SAG_CONFIG_SYNC_OPERATION_TIMEOUT_MS` / `SAG_CONFIG_SYNC_UNKNOWN_OUTCOME_ISOLATION_MS` | 单次 APISIX 操作上限；超时后继续持有 App 租约，在有限隔离窗内避免迟到旧写与新 generation 重叠。APISIX Admin API 没有 generation/CAS；隔离窗必须大于 APISIX 服务端硬执行上限，超过隔离窗的极迟写由周期对账最终修复 | `10000` / `60000` |
+| **control-plane-admin** | `SAG_CONTROL_PLANE_HTTP_TIMEOUT_MS` / `SAG_APISIX_RECONCILE_TIMEOUT_SEC` | 单 HTTP 请求与整轮 APISIX 对账的有界超时 | `8000` / `20` |
+| **control-plane-admin** | `SAG_APISIX_RECONCILE_MAX_PAGES` / `SAG_APISIX_RECONCILE_MAX_ROUTES` | APISIX inventory 分页和总路由数硬上限，防止异常分页永久占用 worker | `20` / `10000` |
+| **control-plane-admin** | `SAG_AGENT_APPLY_ACTIVE_WINDOW_SEC` / `SAG_AGENT_APPLY_RETENTION_SEC` | Agent ACK 在活跃窗口外不参与 generation lag 告警；超过保留期只清理旧版无快照指纹的 ACK，带指纹的 generation floor 为防重启回退而保留 | `300` / `604800` |
+| **control-plane-admin** | `SAG_APISIX_ADOPT_LEGACY_ROUTES` | 是否允许首次同步接管同 ID、但尚无 SAG ownership label 的旧 APISIX route。二进制及 Edge/双机部署默认 `false`；只应在人工核验路由归属后短期开启，迁移成功即关闭 | 本地一体化 Compose 一次性迁移默认 `true`；其他部署 `false` |
+| **control-plane-admin** | `SAG_APISIX_RECONCILE_ENABLED` / `SAG_APISIX_RECONCILE_INTERVAL_SEC` | 周期读取 APISIX 实际 managed routes，修复缺失/漂移并删除幽灵路由 | `true` / `30` |
 | **sag-policy** | `SAG_STORAGE_DB_PATH` | 与 **control-plane-admin 共用** 同一 SQLite 文件（policies 表）；代码内默认与 admin **同一相对路径规则** | `data/sag-storage/sag.db`（同左） |
 | **sag-auth** | `SAG_JWT_SECRET` | JWT 签名密钥 | 如 `dev-jwt-secret` |
 | **sag-auth** | `SAG_JWT_EXPIRES_SEC` | SAG JWT 过期秒数 | 默认 `3600` |
@@ -244,16 +251,22 @@ APISIX 自带**嵌入在 Admin 端口上的 Web UI**（需 `deployment.admin.ena
 | **sag-connector** | `SAG_CONNECTOR_ACCEPT_QUEUE` | 有界接收队列容量；满则 **503**（`connector_forward_reject_total`） | 默认 `max(512, 2×max_inflight)` |
 | **sag-connector** | `SAG_CONNECTOR_HTTP_TIMEOUT_MS` | `reqwest` 单次转发总超时（宜 **短于** agent `forward_timeout`、bridge forward） | `55000` |
 | **sag-connector** | `SAG_CONNECTOR_GRPC_CHANNEL_TIMEOUT_MS` | tonic `Endpoint::timeout`（与隧道长连接语义对齐，宜 ≥ 心跳周期） | `120000` |
+| **sag-connector** | `SAG_CONNECTOR_OUTBOUND_SEND_TIMEOUT_MS` | Connector 向 Agent 回写心跳、ACK、响应时的有界发送等待；超时说明响应流不可写并触发连接退出重连 | `2000` |
 | **sag-connector** | `SAG_CONNECTOR_MAX_RESPONSE_BODY_BYTES` | 流式响应体上限，`0` 表示不限制；超限立即停止读取并返回 **502** | `4194304` |
 | **sag-connector**（gRPC mTLS） | `SAG_GRPC_MTLS_ENABLED` 等 | 与 Agent 间证书路径，见连接器 README/源码 | 默认 mTLS 开启 |
-| **stealth-tunnel-agent** | `SAG_CONTROL_PLANE_SYNC_ENDPOINT` | 从控制面拉取路由；**支持逗号分隔多个 URL**，按顺序尝试直到成功；若你只配置了非本机地址且未包含 `127.0.0.1`，进程会**自动在前面追加** `http://127.0.0.1:8090/api/v1/agent/routes`（便于 WSL→Windows 上的 admin） | `http://127.0.0.1:8090/api/v1/agent/routes` |
+| **stealth-tunnel-agent** | `SAG_CONTROL_PLANE_SYNC_ENDPOINT` | 从控制面拉取路由；**支持逗号分隔多个 URL**，并发读取所有可达端点后只应用最高 generation；同 generation 内容不一致时 fail-closed。若只配置了非本机地址且未包含 `127.0.0.1`，进程会自动追加本机 fallback（可由下一项关闭） | `http://127.0.0.1:8090/api/v1/agent/routes` |
+| **stealth-tunnel-agent** | `SAG_CONTROL_PLANE_SYNC_MAX_BODY_BYTES` / `SAG_CONTROL_PLANE_SYNC_MAX_ROUTES` | 单个路由快照响应体与记录数硬上限；无 `Content-Length` 时也按流式累计字节拒绝超限响应 | `4194304` / `10000` |
+| **stealth-tunnel-agent** | `SAG_AGENT_INSTANCE_ID` | Agent 配置 generation ACK 与快照指纹的持久身份。生产必须跨重启保持稳定，并在同一部署内每个 Agent 副本唯一；新快照在 ACK 持久化前不可解析且不进入 ready，重启后会恢复 generation floor | 本地 `local-agent-1`；Edge `edge-agent-1`；第二副本 `edge-agent-2` |
+| **stealth-tunnel-agent** | `SAG_AGENT_MAX_ROUTE_SYNC_AGE_SEC` | 最近一次成功、内容一致的配置快照超过此年龄后 readiness fail-closed | `60` |
 | **stealth-tunnel-agent** | `SAG_CONTROL_PLANE_SYNC_NO_LOCALHOST_FALLBACK` | `true` 时**禁用**上述自动追加 localhost（仅当你确定不要访问本机 8090） | （不设） |
 | **stealth-tunnel-agent** | `SAG_FORWARD_TIMEOUT_MS` | 等待 connector 返回 forward 的上限（应 **>** `SAG_CONNECTOR_HTTP_TIMEOUT_MS`，**<** bridge `SAG_GRPC_RPC_TIMEOUT_MS`） | `58000`（edge compose） |
 | **stealth-tunnel-agent** | `SAG_MAX_PENDING_WAITERS` | 所有 Connector session 共享的 pending forward 上限 | `8192`（edge compose） |
 | **stealth-tunnel-agent** | `SAG_TUNNEL_HEALTHY_WINDOW_SEC` | generation-bound Connector 心跳租约；过期后主动摘除 session 并唤醒其 pending | `10` |
+| **stealth-tunnel-agent** | `SAG_AGENT_STREAM_SEND_TIMEOUT_MS` | Agent 向 Connector gRPC 响应流写入请求/控制帧的有界等待；超时后结束该 generation，避免堵塞流继续被判为健康 | `1000` |
 | **stealth-tunnel-agent** | `SAG_CONNECTOR_CERT_BINDINGS` | `endpoint=证书SHA256`，逗号分隔；同 endpoint 可重复配置多个副本证书 | mTLS 开启时必填 |
 
 > `tunnel_routes.require_healthy_tunnel` 为兼容旧控制面字段而保留；Agent 数据面始终强制执行 generation-bound 心跳租约，不能再通过该字段绕过健康检查。
+> **配置同步部署强约束**：所有 `SAG_CONTROL_PLANE_SYNC_ENDPOINT` 与 Agent 自身必须连接同一持久 PostgreSQL 集群（单机 SQLite 时必须是同一文件）。不同端点各用独立数据库属于不支持拓扑，因为某端点返回的 ACK 无法成为 Agent 重启时可恢复的 generation floor。新 generation 等待 ACK 时会暂时隐藏旧路由并 fail-closed，这是防止未持久配置被使用或重启回退的有意可用性取舍。
 | **stealth-tunnel-agent** | `SAG_AGENT_DEBUG_ADMIN` | `1`/`true` 时在本机监听 **`SAG_AGENT_DEBUG_LISTEN`（默认 `127.0.0.1:19104`）**，提供 **`POST /debug/clear-ephemeral-caches`**：清空策略 Moka 缓存、负缓存、`policy_eval` 合并 map（**不**断开 connector 隧道） | （默认关闭） |
 | **stealth-tunnel-agent** | `SAG_AGENT_DEBUG_LISTEN` | 上项开启时的 debug HTTP 绑定地址 | `127.0.0.1:19104` |
 | **http-tunnel-bridge** | `SAG_BRIDGE_REDIS_URL` | 设后：`sync_inflight ≥ soft` **或** 隧道并发 **try 失败** 时 **202** 入队 + worker；空则全程同步 forward | edge 默认 `redis://redis:6379/2` |
@@ -670,7 +683,39 @@ Fake 4A 页面提供 “未认证访客（预期被拦截）” 入口，用于�
   - `SAG_STORAGE_BACKEND=sqlite`（默认）
   - `SAG_STORAGE_BACKEND=postgres`（配 `SAG_POSTGRES_DSN`）
 - `control-plane-admin` 与 `sag-policy` 均已切到统一 `StorageStore`，无需业务代码区分数据库方言。
-- PostgreSQL 初始化 SQL 见：`infra/migrations/postgres/001_init.sql`
+- PostgreSQL 初始化及增量 SQL 见：`infra/migrations/postgres/001_init.sql` 至
+  `infra/migrations/postgres/005_config_convergence.sql`。
+
+#### SQLite → PostgreSQL 切库迁移
+
+迁移前先备份 SQLite 与 PostgreSQL，并停止所有会写入源库或目标库的服务，至少包括
+`control-plane-admin`、`sag-auth` 和 `sag-policy`；目标端的
+`control-plane-admin`/APISIX 同步 worker 也不能同时运行。迁移器会使用一致的 SQLite
+读事务和单个 PostgreSQL 写事务，但两个数据库之间不存在分布式原子提交，因此迁移期间
+必须保持静默写入。目标库默认必须是已完成 schema 初始化的空库；普通业务表采用 upsert，
+不会删除仅存在于目标库的旧行，因此检测到已有业务、Agent ACK 或同步任务数据时会
+fail-fast。只有在人工审查 merge 语义后，才可显式设置
+`SAG_MIGRATION_ALLOW_NONEMPTY_DESTINATION=true`；重复执行迁移也需要该开关。
+
+```powershell
+$env:SAG_SRC_SQLITE_DB_PATH = "D:\backup\sag.db"
+$env:SAG_DST_POSTGRES_DSN = "postgres://sag:<password>@127.0.0.1:5432/sag"
+cargo run -p control-plane-admin --bin migrate_sqlite_to_postgres
+```
+
+迁移器会在同一个 PostgreSQL 事务中：
+
+- 把 `config_state.generation` 设置为高于源 generation、目标 generation、目标旧任务和
+  目标旧 ACK 的新值，避免 Agent 切库后收到回退版本；
+- 将目标库旧的未完成 APISIX 任务标记为被新 generation 取代；
+- 为每个同时拥有 `tunnel_routes` 和 `intranet_upstreams` 的当前有效 app，生成同一
+  generation 的 `APISIX/ROUTE/UPSERT` PENDING 任务，供 worker 全量收敛实际面。
+
+源库的 `agent_config_applies` 不迁移，切库后必须由 Agent 对 PostgreSQL 快照重新 ACK；
+源库的 `config_sync_jobs` 也不迁移，因为其中的 lease、重试次数和执行状态只属于旧运行
+实例。命令成功输出 `destination_after` 和任务数后，再将各服务配置为
+`SAG_STORAGE_BACKEND=postgres`，启动服务并确认 Agent 产生新 ACK、APISIX 任务最终变为
+`APPLIED`。重复运行会有意再次提升 generation 并重新生成全量收敛任务。
 
 ### 10.2 统一配置模板
 

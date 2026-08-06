@@ -1,9 +1,12 @@
+use std::collections::BTreeMap;
+use std::net::{Ipv4Addr, Ipv6Addr};
+
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ApiRouteRecord, AppRecord, GroupRoleMappingRecord, IdentityProviderRecord,
-    IntranetUpstreamRecord, PolicyEffect, PolicyRecord, StorageError, StorageStore,
-    TunnelRouteRecord, UserRecord,
+    ApiRouteRecord, AppRecord, ConfigSyncJobDraft, ConfigSyncOperation, ConfigSyncStore,
+    GroupRoleMappingRecord, IdentityProviderRecord, IntranetUpstreamRecord, PolicyEffect,
+    PolicyRecord, StorageError, StorageStore, TunnelRouteRecord, UserRecord,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -123,6 +126,85 @@ mod transaction_tests {
                 .unwrap_or(false)
         }));
     }
+
+    #[test]
+    fn route_configuration_snapshot_rejects_unresolvable_shapes() {
+        let valid_route = TunnelRouteRecord {
+            host: "app.internal".into(),
+            app_id: "app-1".into(),
+            connector_endpoint: "connector-local-001:stream".into(),
+            require_healthy_tunnel: true,
+        };
+        for upstream in [
+            "bad!host:8080",
+            "[not-an-ip]:8080",
+            "missing-port",
+            "host:0",
+            "https://host:443/path",
+        ] {
+            let error = validate_route_configuration_snapshot(
+                std::slice::from_ref(&valid_route),
+                &[IntranetUpstreamRecord {
+                    app_id: "app-1".into(),
+                    upstream: upstream.into(),
+                    scheme: "http".into(),
+                }],
+            )
+            .unwrap_err();
+            assert!(matches!(error, StorageError::Validation(_)), "{upstream}");
+        }
+
+        for (host, connector_endpoint) in
+            [("bad!host", "connector:stream"), ("app.internal", "::::")]
+        {
+            let error = validate_route_configuration_snapshot(
+                &[TunnelRouteRecord {
+                    host: host.into(),
+                    connector_endpoint: connector_endpoint.into(),
+                    ..valid_route.clone()
+                }],
+                &[],
+            )
+            .unwrap_err();
+            assert!(matches!(error, StorageError::Validation(_)));
+        }
+
+        let uppercase_scheme = validate_route_configuration_snapshot(
+            std::slice::from_ref(&valid_route),
+            &[IntranetUpstreamRecord {
+                app_id: "app-1".into(),
+                upstream: "upstream.internal:8443".into(),
+                scheme: "HTTPS".into(),
+            }],
+        )
+        .unwrap_err();
+        assert!(matches!(uppercase_scheme, StorageError::Validation(_)));
+    }
+
+    #[test]
+    fn route_configuration_snapshot_accepts_dns_ipv4_and_ipv6_upstreams() {
+        let route = TunnelRouteRecord {
+            host: "app-1.internal".into(),
+            app_id: "app-1".into(),
+            connector_endpoint: "connector_1:stream.v1".into(),
+            require_healthy_tunnel: true,
+        };
+        for upstream in [
+            "apisix-upstream:8080",
+            "127.0.0.1:8080",
+            "[2001:db8::1]:8443",
+        ] {
+            validate_route_configuration_snapshot(
+                std::slice::from_ref(&route),
+                &[IntranetUpstreamRecord {
+                    app_id: "app-1".into(),
+                    upstream: upstream.into(),
+                    scheme: "https".into(),
+                }],
+            )
+            .unwrap();
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -156,6 +238,451 @@ pub enum SecurityMutation {
     UpsertIntranetUpstream(IntranetUpstreamRecord),
 }
 
+fn validate_config_token(name: &str, value: &str, max_len: usize) -> Result<(), StorageError> {
+    if value.is_empty()
+        || value.trim() != value
+        || value.len() > max_len
+        || value.chars().any(char::is_whitespace)
+        || value.chars().any(char::is_control)
+    {
+        return Err(StorageError::Validation(format!(
+            "{name} must be 1..={max_len} characters with no leading/trailing, whitespace, or control characters"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_upstream_authority(upstream: &str) -> Result<(), StorageError> {
+    validate_config_token("upstream", upstream, 255)?;
+    if ['/', '?', '#']
+        .into_iter()
+        .any(|character| upstream.contains(character))
+        || upstream.contains("://")
+    {
+        return Err(StorageError::Validation(
+            "upstream must be a host:port authority without a scheme or path".into(),
+        ));
+    }
+    let (host, port, bracketed_ipv6) = if let Some(bracketed) = upstream.strip_prefix('[') {
+        let (host, port) = bracketed.split_once("]:").ok_or_else(|| {
+            StorageError::Validation("IPv6 upstream must use [address]:port".into())
+        })?;
+        (host, port, true)
+    } else {
+        let (host, port) = upstream.rsplit_once(':').ok_or_else(|| {
+            StorageError::Validation("upstream must include an explicit port".into())
+        })?;
+        if host.contains(':') {
+            return Err(StorageError::Validation(
+                "IPv6 upstream must use [address]:port".into(),
+            ));
+        }
+        (host, port, false)
+    };
+    if host.is_empty() || port.parse::<u16>().ok().is_none_or(|port| port == 0) {
+        return Err(StorageError::Validation(
+            "upstream must contain a non-empty host and port in 1..=65535".into(),
+        ));
+    }
+    if bracketed_ipv6 {
+        host.parse::<Ipv6Addr>().map_err(|_| {
+            StorageError::Validation("bracketed upstream host must be a valid IPv6 address".into())
+        })?;
+    } else {
+        validate_dns_or_ipv4_host("upstream host", host)?;
+    }
+    Ok(())
+}
+
+fn validate_dns_or_ipv4_host(name: &str, host: &str) -> Result<(), StorageError> {
+    if host.parse::<Ipv4Addr>().is_ok() {
+        return Ok(());
+    }
+    let valid_dns_name = host.len() <= 253
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                && label
+                    .as_bytes()
+                    .first()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+                && label
+                    .as_bytes()
+                    .last()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+        });
+    if !valid_dns_name {
+        return Err(StorageError::Validation(format!(
+            "{name} must be a valid IPv4 address or DNS name"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_tunnel_route_shape(record: &TunnelRouteRecord) -> Result<(), StorageError> {
+    validate_config_token("host", &record.host, 253)?;
+    if ['/', '?', '#', '\\']
+        .into_iter()
+        .any(|character| record.host.contains(character))
+        || record.host.contains("://")
+    {
+        return Err(StorageError::Validation(
+            "host must not contain a scheme, path, query, or fragment".into(),
+        ));
+    }
+    if let Some(ipv6) = record
+        .host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+    {
+        ipv6.parse::<Ipv6Addr>().map_err(|_| {
+            StorageError::Validation("bracketed route host must be a valid IPv6 address".into())
+        })?;
+    } else {
+        if record.host.contains(':') {
+            return Err(StorageError::Validation(
+                "IPv6 route host must use [address] notation".into(),
+            ));
+        }
+        validate_dns_or_ipv4_host("host", &record.host)?;
+    }
+
+    validate_config_token("app_id", &record.app_id, 128)?;
+    validate_config_token("connector_endpoint", &record.connector_endpoint, 255)?;
+    let valid_connector_endpoint = record.connector_endpoint.split(':').all(|segment| {
+        !segment.is_empty()
+            && segment.bytes().any(|byte| byte.is_ascii_alphanumeric())
+            && segment
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    });
+    if !valid_connector_endpoint {
+        return Err(StorageError::Validation(
+            "connector_endpoint must contain non-empty ':'-separated logical labels using ASCII letters, digits, '-', '_', or '.'"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_intranet_upstream_shape(record: &IntranetUpstreamRecord) -> Result<(), StorageError> {
+    validate_config_token("app_id", &record.app_id, 128)?;
+    validate_upstream_authority(&record.upstream)?;
+    if !matches!(record.scheme.as_str(), "http" | "https") {
+        return Err(StorageError::Validation(
+            "scheme must be exactly http or https".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Validates a complete desired route snapshot before bulk import or cutover.
+/// This applies the same row-shape rules as online mutations and also enforces
+/// the Agent invariant that every host for one app resolves to one Connector
+/// endpoint and health policy.
+pub fn validate_route_configuration_snapshot(
+    routes: &[TunnelRouteRecord],
+    upstreams: &[IntranetUpstreamRecord],
+) -> Result<(), StorageError> {
+    let mut app_connectors = BTreeMap::<&str, (&str, bool)>::new();
+    for route in routes {
+        validate_tunnel_route_shape(route)?;
+        match app_connectors.get(route.app_id.as_str()) {
+            Some((endpoint, require_healthy_tunnel))
+                if *endpoint != route.connector_endpoint
+                    || *require_healthy_tunnel != route.require_healthy_tunnel =>
+            {
+                return Err(StorageError::Conflict(format!(
+                    "all routes for app_id {} must use the same connector_endpoint and require_healthy_tunnel value",
+                    route.app_id
+                )));
+            }
+            Some(_) => {}
+            None => {
+                app_connectors.insert(
+                    route.app_id.as_str(),
+                    (
+                        route.connector_endpoint.as_str(),
+                        route.require_healthy_tunnel,
+                    ),
+                );
+            }
+        }
+    }
+    for upstream in upstreams {
+        validate_intranet_upstream_shape(upstream)?;
+    }
+    Ok(())
+}
+
+fn validate_config_mutation_shape(mutation: &SecurityMutation) -> Result<(), StorageError> {
+    match mutation {
+        SecurityMutation::UpsertTunnelRoute(record) => validate_tunnel_route_shape(record)?,
+        SecurityMutation::DeleteTunnelRoute(host) => {
+            validate_config_token("host", host, 253)?;
+        }
+        SecurityMutation::UpsertIntranetUpstream(record) => {
+            validate_intranet_upstream_shape(record)?
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn is_route_config_mutation(mutation: &SecurityMutation) -> bool {
+    matches!(
+        mutation,
+        SecurityMutation::UpsertTunnelRoute(_)
+            | SecurityMutation::DeleteTunnelRoute(_)
+            | SecurityMutation::UpsertIntranetUpstream(_)
+    )
+}
+
+fn validate_sqlite_route_consistency(
+    transaction: &rusqlite::Transaction<'_>,
+    mutation: &SecurityMutation,
+) -> Result<(), StorageError> {
+    let SecurityMutation::UpsertTunnelRoute(record) = mutation else {
+        return Ok(());
+    };
+    let conflicts: i64 = transaction.query_row(
+        "SELECT EXISTS( \
+           SELECT 1 FROM tunnel_routes \
+           WHERE app_id = ?1 AND host <> ?2 \
+             AND (connector_endpoint <> ?3 OR require_healthy_tunnel <> ?4) \
+         )",
+        rusqlite::params![
+            record.app_id,
+            record.host,
+            record.connector_endpoint,
+            i32::from(record.require_healthy_tunnel)
+        ],
+        |row| row.get(0),
+    )?;
+    if conflicts != 0 {
+        return Err(StorageError::Conflict(format!(
+            "all routes for app_id {} must use the same connector_endpoint and require_healthy_tunnel value",
+            record.app_id
+        )));
+    }
+    Ok(())
+}
+
+async fn lock_postgres_config_apps(
+    transaction: &tokio_postgres::Transaction<'_>,
+    mutation: &SecurityMutation,
+    previous_route_app: Option<&str>,
+) -> Result<(), StorageError> {
+    for app_id in affected_config_apps(mutation, previous_route_app) {
+        transaction
+            .query_one(
+                "SELECT pg_advisory_xact_lock(\
+                   hashtextextended(json_build_array('APISIX'::TEXT, $1::TEXT)::TEXT, 0)\
+                 )",
+                &[&app_id],
+            )
+            .await?;
+    }
+    Ok(())
+}
+
+async fn validate_postgres_route_consistency(
+    transaction: &tokio_postgres::Transaction<'_>,
+    mutation: &SecurityMutation,
+) -> Result<(), StorageError> {
+    let SecurityMutation::UpsertTunnelRoute(record) = mutation else {
+        return Ok(());
+    };
+    let conflicts: bool = transaction
+        .query_one(
+            "SELECT EXISTS( \
+               SELECT 1 FROM tunnel_routes \
+               WHERE app_id = $1 AND host <> $2 \
+                 AND (connector_endpoint <> $3 OR require_healthy_tunnel <> $4) \
+             )",
+            &[
+                &record.app_id,
+                &record.host,
+                &record.connector_endpoint,
+                &record.require_healthy_tunnel,
+            ],
+        )
+        .await?
+        .get(0);
+    if conflicts {
+        return Err(StorageError::Conflict(format!(
+            "all routes for app_id {} must use the same connector_endpoint and require_healthy_tunnel value",
+            record.app_id
+        )));
+    }
+    Ok(())
+}
+
+fn affected_config_apps(
+    mutation: &SecurityMutation,
+    previous_route_app: Option<&str>,
+) -> Vec<String> {
+    let mut app_ids = match mutation {
+        SecurityMutation::UpsertTunnelRoute(record) => {
+            let mut app_ids = vec![record.app_id.clone()];
+            if previous_route_app.is_some_and(|app_id| app_id != record.app_id) {
+                app_ids.push(previous_route_app.unwrap().to_string());
+            }
+            app_ids
+        }
+        SecurityMutation::DeleteTunnelRoute(_) => previous_route_app
+            .map(|app_id| vec![app_id.to_string()])
+            .unwrap_or_default(),
+        SecurityMutation::UpsertIntranetUpstream(record) => vec![record.app_id.clone()],
+        _ => Vec::new(),
+    };
+    app_ids.sort();
+    app_ids.dedup();
+    app_ids
+}
+
+fn previous_sqlite_route_app(
+    transaction: &rusqlite::Transaction<'_>,
+    mutation: &SecurityMutation,
+) -> Result<Option<String>, StorageError> {
+    use rusqlite::OptionalExtension;
+
+    let host = match mutation {
+        SecurityMutation::UpsertTunnelRoute(record) => Some(record.host.as_str()),
+        SecurityMutation::DeleteTunnelRoute(host) => Some(host.as_str()),
+        _ => None,
+    };
+    let Some(host) = host else {
+        return Ok(None);
+    };
+    transaction
+        .query_row(
+            "SELECT app_id FROM tunnel_routes WHERE host = ?1",
+            [host],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(StorageError::from)
+}
+
+async fn previous_postgres_route_app(
+    transaction: &tokio_postgres::Transaction<'_>,
+    mutation: &SecurityMutation,
+) -> Result<Option<String>, StorageError> {
+    let host = match mutation {
+        SecurityMutation::UpsertTunnelRoute(record) => Some(record.host.as_str()),
+        SecurityMutation::DeleteTunnelRoute(host) => Some(host.as_str()),
+        _ => None,
+    };
+    let Some(host) = host else {
+        return Ok(None);
+    };
+    // Serialize ownership changes even when the host row does not exist yet.
+    // A row-level FOR UPDATE cannot fence concurrent inserts, while this
+    // transaction-scoped advisory lock covers both insert and move cases.
+    transaction
+        .query_one(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+            &[&host],
+        )
+        .await?;
+    Ok(transaction
+        .query_opt("SELECT app_id FROM tunnel_routes WHERE host = $1", &[&host])
+        .await?
+        .map(|row| row.get(0)))
+}
+
+fn apply_sqlite_config_convergence(
+    transaction: &rusqlite::Transaction<'_>,
+    mutation: &SecurityMutation,
+    previous_route_app: Option<&str>,
+    changed_at_ms: i64,
+) -> Result<(), StorageError> {
+    let app_ids = affected_config_apps(mutation, previous_route_app);
+    if app_ids.is_empty() {
+        return Ok(());
+    }
+    let generation =
+        ConfigSyncStore::bump_generation_sqlite_transaction(transaction, changed_at_ms)?;
+    for app_id in app_ids {
+        let (has_route, has_upstream): (i64, i64) = transaction.query_row(
+            "SELECT \
+               EXISTS(SELECT 1 FROM tunnel_routes WHERE app_id = ?1), \
+               EXISTS(SELECT 1 FROM intranet_upstreams WHERE app_id = ?1)",
+            [&app_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let operation = if has_route != 0 && has_upstream != 0 {
+            ConfigSyncOperation::Upsert
+        } else {
+            ConfigSyncOperation::Delete
+        };
+        ConfigSyncStore::enqueue_sqlite_transaction(
+            transaction,
+            &ConfigSyncJobDraft {
+                generation,
+                target: "APISIX".into(),
+                resource_type: "ROUTE".into(),
+                resource_id: app_id.clone(),
+                app_id,
+                operation,
+                payload_json: None,
+                next_attempt_at_ms: changed_at_ms,
+            },
+            changed_at_ms,
+        )?;
+    }
+    Ok(())
+}
+
+async fn apply_postgres_config_convergence(
+    transaction: &tokio_postgres::Transaction<'_>,
+    mutation: &SecurityMutation,
+    previous_route_app: Option<&str>,
+    changed_at_ms: i64,
+) -> Result<(), StorageError> {
+    let app_ids = affected_config_apps(mutation, previous_route_app);
+    if app_ids.is_empty() {
+        return Ok(());
+    }
+    let generation =
+        ConfigSyncStore::bump_generation_postgres_transaction(transaction, changed_at_ms).await?;
+    for app_id in app_ids {
+        let row = transaction
+            .query_one(
+                "SELECT \
+                   EXISTS(SELECT 1 FROM tunnel_routes WHERE app_id = $1), \
+                   EXISTS(SELECT 1 FROM intranet_upstreams WHERE app_id = $1)",
+                &[&app_id],
+            )
+            .await?;
+        let operation = if row.get::<_, bool>(0) && row.get::<_, bool>(1) {
+            ConfigSyncOperation::Upsert
+        } else {
+            ConfigSyncOperation::Delete
+        };
+        ConfigSyncStore::enqueue_postgres_transaction(
+            transaction,
+            &ConfigSyncJobDraft {
+                generation,
+                target: "APISIX".into(),
+                resource_type: "ROUTE".into(),
+                resource_id: app_id.clone(),
+                app_id,
+                operation,
+                payload_json: None,
+                next_attempt_at_ms: changed_at_ms,
+            },
+            changed_at_ms,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 pub struct AuditLogsStore;
 
 impl AuditLogsStore {
@@ -171,8 +698,18 @@ impl AuditLogsStore {
                 let audit = audit.clone();
                 tokio::task::spawn_blocking(move || {
                     let mut connection = rusqlite::Connection::open(sqlite.path())?;
-                    let transaction = connection.transaction()?;
+                    let transaction = connection
+                        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                    validate_config_mutation_shape(&mutation)?;
+                    let previous_route_app = previous_sqlite_route_app(&transaction, &mutation)?;
+                    validate_sqlite_route_consistency(&transaction, &mutation)?;
                     execute_sqlite_security_mutation(&transaction, &mutation)?;
+                    apply_sqlite_config_convergence(
+                        &transaction,
+                        &mutation,
+                        previous_route_app.as_deref(),
+                        audit.ts_ms,
+                    )?;
                     insert_sqlite_audit_strict(&transaction, &audit)?;
                     transaction.commit()?;
                     Ok::<_, StorageError>(())
@@ -183,7 +720,32 @@ impl AuditLogsStore {
             StorageStore::Postgres(postgres) => {
                 let mut client = postgres.client().await?;
                 let transaction = client.transaction().await?;
+                validate_config_mutation_shape(mutation)?;
+                if is_route_config_mutation(mutation) {
+                    // Generation increments serialize eventually; take the
+                    // same singleton row lock before validation so two
+                    // replicas cannot both validate incompatible app routes
+                    // against a snapshot that excludes the other's insert.
+                    transaction
+                        .query_one(
+                            "SELECT generation FROM config_state WHERE id = 1 FOR UPDATE",
+                            &[],
+                        )
+                        .await?;
+                }
+                let previous_route_app =
+                    previous_postgres_route_app(&transaction, mutation).await?;
+                lock_postgres_config_apps(&transaction, mutation, previous_route_app.as_deref())
+                    .await?;
+                validate_postgres_route_consistency(&transaction, mutation).await?;
                 execute_postgres_security_mutation(&transaction, mutation).await?;
+                apply_postgres_config_convergence(
+                    &transaction,
+                    mutation,
+                    previous_route_app.as_deref(),
+                    audit.ts_ms,
+                )
+                .await?;
                 insert_postgres_audit_strict(&transaction, audit).await?;
                 transaction.commit().await?;
                 Ok(())

@@ -16,6 +16,10 @@ pub enum StorageError {
     PostgresPoolAcquireTimeout { timeout_ms: u64 },
     #[error("storage configuration: {0}")]
     Configuration(String),
+    #[error("storage validation: {0}")]
+    Validation(String),
+    #[error("storage conflict: {0}")]
+    Conflict(String),
     #[error("storage invariant: {0}")]
     Invariant(String),
 }

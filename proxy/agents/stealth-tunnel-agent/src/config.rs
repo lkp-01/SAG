@@ -7,7 +7,8 @@ use serde::Deserialize;
 pub struct StealthTunnelConfig {
     #[serde(default = "default_listen_addr")]
     pub listen_addr: String,
-    /// URLs to `GET` tunnel routes from (tried in order). Built by [`control_plane_sync_endpoints_from_env`].
+    /// URLs to `GET` tunnel routes from concurrently; the highest consistent
+    /// generation wins. Built by [`control_plane_sync_endpoints_from_env`].
     #[serde(default = "default_control_plane_sync_endpoints")]
     pub control_plane_sync_endpoints: Vec<String>,
     #[serde(default = "default_sync_interval_ms")]
@@ -49,6 +50,20 @@ pub struct StealthTunnelConfig {
     /// Health window for connector heartbeats. If last heartbeat is older than this, agent treats tunnel unhealthy.
     #[serde(default = "default_tunnel_healthy_window_sec")]
     pub tunnel_healthy_window_sec: u64,
+    /// Require a successful Agent -> Connector dispatcher -> Agent round trip
+    /// in addition to a fresh heartbeat before assigning business traffic.
+    #[serde(default = "default_connector_probe_enabled")]
+    pub connector_probe_enabled: bool,
+    #[serde(default = "default_connector_probe_interval_ms")]
+    pub connector_probe_interval_ms: u64,
+    #[serde(default = "default_connector_probe_timeout_ms")]
+    pub connector_probe_timeout_ms: u64,
+    #[serde(default = "default_connector_probe_freshness_ms")]
+    pub connector_probe_freshness_ms: u64,
+    #[serde(default = "default_connector_probe_startup_grace_ms")]
+    pub connector_probe_startup_grace_ms: u64,
+    #[serde(default = "default_connector_probe_failure_threshold")]
+    pub connector_probe_failure_threshold: u8,
     #[serde(default = "default_grpc_tls_enabled")]
     pub grpc_tls_enabled: bool,
     pub grpc_tls_cert: Option<String>,
@@ -75,16 +90,15 @@ fn default_control_plane_sync_endpoints() -> Vec<String> {
 }
 
 /// Resolves sync URLs from `SAG_CONTROL_PLANE_SYNC_ENDPOINT` (comma-separated allowed).
-/// Unless `SAG_CONTROL_PLANE_SYNC_NO_LOCALHOST_FALLBACK=true`, prepends `http://127.0.0.1:8090/api/v1/agent/routes`
-/// when missing so WSL→Windows `control-plane-admin` often works without manual `WIN_IP`.
-pub fn control_plane_sync_endpoints_from_env() -> Vec<String> {
+/// Unless `SAG_CONTROL_PLANE_SYNC_NO_LOCALHOST_FALLBACK=true`, appends
+/// localhost as the lowest-priority fallback. Every reachable endpoint is
+/// still generation-compared by the sync loop.
+fn resolve_control_plane_sync_endpoints(
+    configured: Option<&str>,
+    no_local_fallback: bool,
+) -> Vec<String> {
     const LOCAL: &str = "http://127.0.0.1:8090/api/v1/agent/routes";
-    let no_local_fallback = std::env::var("SAG_CONTROL_PLANE_SYNC_NO_LOCALHOST_FALLBACK")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
-
-    let mut urls: Vec<String> = std::env::var("SAG_CONTROL_PLANE_SYNC_ENDPOINT")
-        .ok()
+    let mut urls: Vec<String> = configured
         .map(|s| {
             s.split(',')
                 .map(|x| x.trim().to_string())
@@ -97,9 +111,17 @@ pub fn control_plane_sync_endpoints_from_env() -> Vec<String> {
         return vec![LOCAL.to_string()];
     }
     if !no_local_fallback && !urls.iter().any(|u| u == LOCAL) {
-        urls.insert(0, LOCAL.to_string());
+        urls.push(LOCAL.to_string());
     }
     urls
+}
+
+pub fn control_plane_sync_endpoints_from_env() -> Vec<String> {
+    let configured = std::env::var("SAG_CONTROL_PLANE_SYNC_ENDPOINT").ok();
+    let no_local_fallback = std::env::var("SAG_CONTROL_PLANE_SYNC_NO_LOCALHOST_FALLBACK")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    resolve_control_plane_sync_endpoints(configured.as_deref(), no_local_fallback)
 }
 
 fn default_sync_interval_ms() -> u64 {
@@ -178,6 +200,33 @@ fn default_negative_cache_ttl_sec() -> u64 {
 
 fn default_tunnel_healthy_window_sec() -> u64 {
     10
+}
+
+fn default_connector_probe_enabled() -> bool {
+    // Keep the binary rolling-upgrade compatible. Managed deployments enable
+    // probing explicitly only after Connectors advertising health-probe-v1 are
+    // available.
+    false
+}
+
+fn default_connector_probe_interval_ms() -> u64 {
+    2_000
+}
+
+fn default_connector_probe_timeout_ms() -> u64 {
+    1_500
+}
+
+fn default_connector_probe_freshness_ms() -> u64 {
+    6_000
+}
+
+fn default_connector_probe_startup_grace_ms() -> u64 {
+    5_000
+}
+
+fn default_connector_probe_failure_threshold() -> u8 {
+    3
 }
 
 fn default_grpc_tls_enabled() -> bool {
@@ -336,6 +385,37 @@ impl StealthTunnelConfig {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or_else(default_tunnel_healthy_window_sec),
+            connector_probe_enabled: env_bool(
+                "SAG_CONNECTOR_PROBE_ENABLED",
+                default_connector_probe_enabled(),
+            ),
+            connector_probe_interval_ms: std::env::var("SAG_CONNECTOR_PROBE_INTERVAL_MS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or_else(default_connector_probe_interval_ms)
+                .max(100),
+            connector_probe_timeout_ms: std::env::var("SAG_CONNECTOR_PROBE_TIMEOUT_MS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or_else(default_connector_probe_timeout_ms)
+                .max(50),
+            connector_probe_freshness_ms: std::env::var("SAG_CONNECTOR_PROBE_FRESHNESS_MS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or_else(default_connector_probe_freshness_ms)
+                .max(100),
+            connector_probe_startup_grace_ms: std::env::var("SAG_CONNECTOR_PROBE_STARTUP_GRACE_MS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or_else(default_connector_probe_startup_grace_ms)
+                .max(100),
+            connector_probe_failure_threshold: std::env::var(
+                "SAG_CONNECTOR_PROBE_FAILURE_THRESHOLD",
+            )
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(default_connector_probe_failure_threshold)
+            .clamp(1, 10),
             grpc_tls_enabled,
             grpc_tls_cert: std::env::var("SAG_GRPC_TLS_CERT").ok(),
             grpc_tls_key: std::env::var("SAG_GRPC_TLS_KEY").ok(),
@@ -423,5 +503,34 @@ mod tests {
         )
         .is_err());
         assert!(validate_agent_memory_budget(128, 128, 0, 1_048_576, 768 * 1024 * 1024).is_err());
+    }
+
+    #[test]
+    fn real_path_probe_has_safe_binary_rollout_defaults() {
+        assert!(!default_connector_probe_enabled());
+        assert_eq!(default_connector_probe_interval_ms(), 2_000);
+        assert_eq!(default_connector_probe_timeout_ms(), 1_500);
+        assert_eq!(default_connector_probe_freshness_ms(), 6_000);
+        assert_eq!(default_connector_probe_failure_threshold(), 3);
+    }
+
+    #[test]
+    fn explicit_control_plane_endpoints_precede_localhost_fallback() {
+        let endpoints = resolve_control_plane_sync_endpoints(
+            Some("http://primary:8090/routes,http://secondary:8090/routes"),
+            false,
+        );
+        assert_eq!(
+            endpoints,
+            vec![
+                "http://primary:8090/routes",
+                "http://secondary:8090/routes",
+                "http://127.0.0.1:8090/api/v1/agent/routes",
+            ]
+        );
+        assert_eq!(
+            resolve_control_plane_sync_endpoints(Some("http://primary:8090/routes"), true),
+            vec!["http://primary:8090/routes"]
+        );
     }
 }

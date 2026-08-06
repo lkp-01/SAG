@@ -5,6 +5,7 @@ mod app_metrics;
 mod apps;
 mod audit_logs;
 mod audit_writer;
+mod config_sync;
 mod error;
 mod fault_events;
 mod idempotency;
@@ -19,8 +20,15 @@ mod users;
 pub use api_routes::{ApiRouteRecord, ApiRoutesStore};
 pub use app_metrics::{AppMetricMinuteRecord, AppMetricsStore};
 pub use apps::{AppRecord, AppsStore};
-pub use audit_logs::{AuditLogFilter, AuditLogRecord, AuditLogsStore, SecurityMutation};
+pub use audit_logs::{
+    validate_route_configuration_snapshot, AuditLogFilter, AuditLogRecord, AuditLogsStore,
+    SecurityMutation,
+};
 pub use audit_writer::{AuditEnqueueError, AuditShutdownReport, AuditWriter, AuditWriterConfig};
+pub use config_sync::{
+    AgentConfigApply, ConfigSyncJob, ConfigSyncJobDraft, ConfigSyncOperation, ConfigSyncStatus,
+    ConfigSyncStore, RouteConfigSnapshot,
+};
 pub use error::StorageError;
 pub use fault_events::{FaultEventFilter, FaultEventRecord, FaultEventsStore};
 pub use idempotency::{IdempotencyClaim, IdempotencyRecord, IdempotencyState, IdempotencyStore};

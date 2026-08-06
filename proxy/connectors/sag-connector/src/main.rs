@@ -14,13 +14,15 @@ use sag_service_health::Readiness;
 use sag_tunnel_proto::{
     tunnel_message, tunnel_service_client::TunnelServiceClient, ConnectorHeartbeat,
     ConnectorRegister, ConnectorRegisterAck, ForwardAccepted, ForwardRequest, ForwardResponse,
-    HttpHeader, TunnelMessage,
+    HealthProbe, HealthProbeAck, HttpHeader, TunnelMessage,
 };
 use tokio::sync::{mpsc, watch, Notify};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
+
+const HEALTH_PROBE_CAPABILITY: &str = "health-probe-v1";
 
 fn default_connector_endpoint(connector_id: &str) -> String {
     format!("{connector_id}:stream")
@@ -227,6 +229,11 @@ struct QueuedRequest {
     cancel: Arc<CancelState>,
 }
 
+enum DispatcherJob {
+    Forward(Box<QueuedRequest>),
+    HealthProbe(HealthProbe),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u8)]
 enum AttemptPhase {
@@ -326,6 +333,59 @@ fn error_response(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutboundSendError {
+    Closed,
+    TimedOut,
+}
+
+impl std::fmt::Display for OutboundSendError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Closed => formatter.write_str("outbound stream is closed"),
+            Self::TimedOut => formatter.write_str("outbound stream send timed out"),
+        }
+    }
+}
+
+impl std::error::Error for OutboundSendError {}
+
+/// Applies one bounded backpressure policy to every Connector -> Agent frame.
+///
+/// A full channel is allowed a short grace period to drain. If the gRPC request
+/// body remains stalled for the whole period, the caller treats the session as
+/// unusable instead of waiting forever while readiness still reports it as up.
+async fn send_outbound_message(
+    sender: &mpsc::Sender<TunnelMessage>,
+    message: TunnelMessage,
+    send_timeout: Duration,
+) -> Result<(), OutboundSendError> {
+    match tokio::time::timeout(send_timeout, sender.send(message)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) => Err(OutboundSendError::Closed),
+        Err(_) => Err(OutboundSendError::TimedOut),
+    }
+}
+
+async fn send_health_probe_ack(
+    sender: &mpsc::Sender<TunnelMessage>,
+    probe: HealthProbe,
+    send_timeout: Duration,
+) -> Result<(), OutboundSendError> {
+    send_outbound_message(
+        sender,
+        TunnelMessage {
+            payload: Some(tunnel_message::Payload::HealthProbeAck(HealthProbeAck {
+                probe_id: probe.probe_id,
+                stream_epoch: probe.stream_epoch,
+                received_unix_ms: now_ms(),
+            })),
+        },
+        send_timeout,
+    )
+    .await
+}
+
 async fn build_channel(
     endpoint: &str,
     tls_enabled: bool,
@@ -417,23 +477,36 @@ async fn run_tunnel_once(
         .unwrap_or(1)
         .max(1);
     let (out_tx, out_rx) = mpsc::channel::<TunnelMessage>(stream_buf);
-    out_tx
-        .send(TunnelMessage {
+    let outbound_send_timeout_ms = env_u64("SAG_CONNECTOR_OUTBOUND_SEND_TIMEOUT_MS", 2_000).max(1);
+    let outbound_send_timeout = Duration::from_millis(outbound_send_timeout_ms);
+    // Any one-way producer that discovers the Agent stream is no longer
+    // writable must wake the owning tunnel loop. Otherwise the heartbeat task
+    // or a dispatcher worker can fail while the main inbound loop remains
+    // blocked and the Connector continues to advertise the session as up.
+    let (fatal_tx, mut fatal_rx) = mpsc::unbounded_channel::<String>();
+    send_outbound_message(
+        &out_tx,
+        TunnelMessage {
             payload: Some(tunnel_message::Payload::Register(ConnectorRegister {
                 connector_id: connector_id.to_string(),
                 app_id: app_id.to_string(),
                 external_host: external_host.to_string(),
                 endpoint: conn_ep.to_string(),
                 stream_epoch: stream_epoch.clone(),
+                capabilities: vec![HEALTH_PROBE_CAPABILITY.to_string()],
             })),
-        })
-        .await?;
+        },
+        outbound_send_timeout,
+    )
+    .await
+    .map_err(|error| anyhow::anyhow!("failed to send Connector registration: {error}"))?;
 
     let hb_interval_ms = env_u64("SAG_CONNECTOR_HEARTBEAT_INTERVAL_MS", 2000).max(200);
     let hb_tx = out_tx.clone();
     let hb_id = connector_id.to_string();
     let hb_ep = conn_ep.to_string();
     let hb_epoch = stream_epoch.clone();
+    let heartbeat_fatal_tx = fatal_tx.clone();
     let heartbeat_task = tokio::spawn(async move {
         let mut iv = tokio::time::interval(Duration::from_millis(hb_interval_ms));
         loop {
@@ -442,18 +515,21 @@ async fn run_tunnel_once(
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0);
-            if hb_tx
-                .send(TunnelMessage {
+            if let Err(error) = send_outbound_message(
+                &hb_tx,
+                TunnelMessage {
                     payload: Some(tunnel_message::Payload::Heartbeat(ConnectorHeartbeat {
                         connector_id: hb_id.clone(),
                         endpoint: hb_ep.clone(),
                         unix_ts: ts,
                         stream_epoch: hb_epoch.clone(),
                     })),
-                })
-                .await
-                .is_err()
+                },
+                outbound_send_timeout,
+            )
+            .await
             {
+                let _ = heartbeat_fatal_tx.send(format!("heartbeat stream send failed: {error}"));
                 break;
             }
         }
@@ -473,13 +549,14 @@ async fn run_tunnel_once(
     let max_request_body = limits.max_request_body;
 
     let apisix_str = apisix.to_string();
-    let (job_tx, mut job_rx) = mpsc::channel::<QueuedRequest>(accept_queue_cap);
+    let (job_tx, mut job_rx) = mpsc::channel::<DispatcherJob>(accept_queue_cap);
     let cancellations = Arc::new(Mutex::new(HashMap::<String, Arc<CancelState>>::new()));
     let out_disp = out_tx.clone();
     let http_disp = http.clone();
     let apisix_disp = apisix_str.clone();
     let cid = connector_id.to_string();
     let cancellations_disp = cancellations.clone();
+    let dispatcher_fatal_tx = fatal_tx.clone();
     type ForwardFut = Pin<Box<dyn Future<Output = ()> + Send>>;
     let dispatch = tokio::spawn(async move {
         let mut in_flight: FuturesUnordered<ForwardFut> = FuturesUnordered::new();
@@ -492,13 +569,15 @@ async fn run_tunnel_once(
                 Some(()) = in_flight.next(), if !in_flight.is_empty() => {}
                 recv = job_rx.recv(), if !closed && in_flight.len() < max_inflight => {
                     match recv {
-                        Some(q) => {
+                        Some(DispatcherJob::Forward(q)) => {
+                            let q = *q;
                             q.cancel.advance(AttemptPhase::Executing);
                             let out_i = out_disp.clone();
                             let http_i = http_disp.clone();
                             let apisix_i = apisix_disp.clone();
                             let cid_i = cid.clone();
                             let cancellations_i = cancellations_disp.clone();
+                            let fatal_i = dispatcher_fatal_tx.clone();
                             in_flight.push(Box::pin(async move {
                                 let attempt_id = attempt_key(&q.req);
                                 let request_id = q.req.request_id.clone();
@@ -560,12 +639,20 @@ async fn run_tunnel_once(
                                 }
 
                                 let t_send = Instant::now();
-                                let send_ok = out_i
-                                    .send(TunnelMessage {
+                                let send_result = send_outbound_message(
+                                    &out_i,
+                                    TunnelMessage {
                                         payload: Some(tunnel_message::Payload::Response(resp)),
-                                    })
-                                    .await
-                                    .is_ok();
+                                    },
+                                    outbound_send_timeout,
+                                )
+                                .await;
+                                let send_ok = send_result.is_ok();
+                                if let Err(error) = send_result {
+                                    let _ = fatal_i.send(format!(
+                                        "response stream send failed for attempt {attempt_id}: {error}"
+                                    ));
+                                }
                                 let send_s = t_send.elapsed().as_secs_f64();
                                 metrics::histogram!(
                                     "connector_forward_out_send_seconds",
@@ -586,6 +673,25 @@ async fn run_tunnel_once(
                                 );
                             }));
                         }
+                        Some(DispatcherJob::HealthProbe(probe)) => {
+                            let out_i = out_disp.clone();
+                            let fatal_i = dispatcher_fatal_tx.clone();
+                            in_flight.push(Box::pin(async move {
+                                let probe_id = probe.probe_id.clone();
+                                if let Err(error) = send_health_probe_ack(
+                                    &out_i,
+                                    probe,
+                                    outbound_send_timeout,
+                                ).await {
+                                    let _ = fatal_i.send(format!(
+                                        "health probe ACK stream send failed for probe {probe_id}: {error}"
+                                    ));
+                                } else {
+                                    metrics::counter!("connector_health_probe_total", "result" => "ok")
+                                        .increment(1);
+                                }
+                            }));
+                        }
                         None => closed = true,
                     }
                 }
@@ -593,61 +699,73 @@ async fn run_tunnel_once(
         }
     });
 
-    let mut inbound = client
-        .create_tunnel(ReceiverStream::new(out_rx))
-        .await?
-        .into_inner();
+    // Everything after the background tasks start runs inside this result
+    // boundary. `?` and `bail!` now leave only the inner future; the common
+    // cancellation/drain epilogue below always executes before we return.
+    let terminal_result: anyhow::Result<()> = async {
+        let mut inbound = client
+            .create_tunnel(ReceiverStream::new(out_rx))
+            .await?
+            .into_inner();
 
-    let ack_timeout =
-        Duration::from_millis(env_u64("SAG_CONNECTOR_REGISTER_ACK_TIMEOUT_MS", 5_000).max(100));
-    let first = tokio::time::timeout(ack_timeout, inbound.next())
-        .await
-        .map_err(|_| anyhow::anyhow!("timed out waiting for matching RegisterAck"))?
-        .ok_or_else(|| anyhow::anyhow!("Agent stream ended before RegisterAck"))??;
-    match first.payload {
-        Some(tunnel_message::Payload::RegisterAck(ack))
-            if register_ack_matches(&ack, connector_id, conn_ep, &stream_epoch) => {}
-        _ => anyhow::bail!("Agent did not send a matching RegisterAck as the first message"),
-    }
-    let _acknowledged_session = health.acknowledge();
+        let ack_timeout = Duration::from_millis(
+            env_u64("SAG_CONNECTOR_REGISTER_ACK_TIMEOUT_MS", 5_000).max(100),
+        );
+        let first = tokio::time::timeout(ack_timeout, inbound.next())
+            .await
+            .map_err(|_| anyhow::anyhow!("timed out waiting for matching RegisterAck"))?
+            .ok_or_else(|| anyhow::anyhow!("Agent stream ended before RegisterAck"))??;
+        match first.payload {
+            Some(tunnel_message::Payload::RegisterAck(ack))
+                if register_ack_matches(&ack, connector_id, conn_ep, &stream_epoch) => {}
+            _ => anyhow::bail!("Agent did not send a matching RegisterAck as the first message"),
+        }
+        let _acknowledged_session = health.acknowledge();
 
-    info!(
-        endpoint = %endpoint,
-        connector_id = %connector_id,
-        apisix = %apisix_str,
-        hb_interval_ms = %hb_interval_ms,
-        stream_buf = %stream_buf,
-        max_inflight = %max_inflight,
-        accept_queue_cap = %accept_queue_cap,
-        http_timeout_ms = %http_timeout_ms,
-        max_response_body = %max_response_body,
-        max_request_body = %max_request_body,
-        stream_epoch = %stream_epoch,
-        "sag-connector tunnel acknowledged (APISIX required)"
-    );
-    let g = metrics::gauge!(
-        "connector_tunnel_up",
-        "connector" => connector_id.to_string(),
-        "app_id" => app_id.to_string(),
-        "agent_endpoint" => endpoint.to_string()
-    );
-    g.set(1.0);
+        info!(
+            endpoint = %endpoint,
+            connector_id = %connector_id,
+            apisix = %apisix_str,
+            hb_interval_ms = %hb_interval_ms,
+            stream_buf = %stream_buf,
+            max_inflight = %max_inflight,
+            accept_queue_cap = %accept_queue_cap,
+            outbound_send_timeout_ms = %outbound_send_timeout_ms,
+            http_timeout_ms = %http_timeout_ms,
+            max_response_body = %max_response_body,
+            max_request_body = %max_request_body,
+            stream_epoch = %stream_epoch,
+            "sag-connector tunnel acknowledged (APISIX required)"
+        );
+        let g = metrics::gauge!(
+            "connector_tunnel_up",
+            "connector" => connector_id.to_string(),
+            "app_id" => app_id.to_string(),
+            "agent_endpoint" => endpoint.to_string()
+        );
+        g.set(1.0);
 
-    loop {
-        let msg = tokio::select! {
-            changed = shutdown.changed() => {
-                if changed.is_err() || *shutdown.borrow() {
-                    break;
+        loop {
+            let msg = tokio::select! {
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        break;
+                    }
+                    continue;
                 }
-                continue;
-            }
-            msg = inbound.next() => {
-                let Some(msg) = msg else { break; };
-                msg
-            }
-        };
-        let msg = msg?;
-        match msg.payload {
+                reason = fatal_rx.recv() => {
+                    anyhow::bail!(
+                        "Connector outbound stream failed: {}",
+                        reason.unwrap_or_else(|| "fatal notification channel closed".into())
+                    );
+                }
+                msg = inbound.next() => {
+                    let Some(msg) = msg else { break; };
+                    msg
+                }
+            };
+            let msg = msg?;
+            match msg.payload {
             Some(tunnel_message::Payload::Request(mut req)) => {
                 if req.stream_epoch != stream_epoch {
                     anyhow::bail!("request stream_epoch does not match active Connector stream");
@@ -665,15 +783,17 @@ async fn run_tunnel_once(
                             "request body exceeds SAG_CONNECTOR_MAX_REQUEST_BODY_BYTES ({max_request_body})"
                         ),
                     );
-                    if out_tx
-                        .send(TunnelMessage {
+                    send_outbound_message(
+                        &out_tx,
+                        TunnelMessage {
                             payload: Some(tunnel_message::Payload::Response(resp)),
-                        })
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
+                        },
+                        outbound_send_timeout,
+                    )
+                    .await
+                    .map_err(|error| {
+                        anyhow::anyhow!("failed to send request-size rejection: {error}")
+                    })?;
                     continue;
                 }
                 if req.deadline_unix_ms > 0 && remaining_until(req.deadline_unix_ms).is_none() {
@@ -684,15 +804,17 @@ async fn run_tunnel_once(
                         504,
                         "request deadline expired before connector enqueue",
                     );
-                    if out_tx
-                        .send(TunnelMessage {
+                    send_outbound_message(
+                        &out_tx,
+                        TunnelMessage {
                             payload: Some(tunnel_message::Payload::Response(resp)),
-                        })
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
+                        },
+                        outbound_send_timeout,
+                    )
+                    .await
+                    .map_err(|error| {
+                        anyhow::anyhow!("failed to send deadline rejection: {error}")
+                    })?;
                     continue;
                 }
 
@@ -713,15 +835,17 @@ async fn run_tunnel_once(
                     metrics::counter!("connector_forward_reject_total", "connector" => connector_id.to_string(), "reason" => "duplicate_attempt")
                         .increment(1);
                     let resp = error_response(&req, 409, "duplicate connector attempt_id");
-                    if out_tx
-                        .send(TunnelMessage {
+                    send_outbound_message(
+                        &out_tx,
+                        TunnelMessage {
                             payload: Some(tunnel_message::Payload::Response(resp)),
-                        })
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
+                        },
+                        outbound_send_timeout,
+                    )
+                    .await
+                    .map_err(|error| {
+                        anyhow::anyhow!("failed to send duplicate-attempt rejection: {error}")
+                    })?;
                     continue;
                 }
 
@@ -730,11 +854,11 @@ async fn run_tunnel_once(
                     attempt_id: key.clone(),
                     stream_epoch: stream_epoch.clone(),
                 };
-                match job_tx.try_send(QueuedRequest {
+                match job_tx.try_send(DispatcherJob::Forward(Box::new(QueuedRequest {
                     enqueued_at: Instant::now(),
                     req,
                     cancel,
-                }) {
+                }))) {
                     Ok(()) => {
                         let state = cancellations
                             .lock()
@@ -744,17 +868,20 @@ async fn run_tunnel_once(
                         if let Some(state) = state {
                             state.advance(AttemptPhase::Accepted);
                         }
-                        if out_tx
-                            .send(TunnelMessage {
+                        send_outbound_message(
+                            &out_tx,
+                            TunnelMessage {
                                 payload: Some(tunnel_message::Payload::Accepted(accepted)),
-                            })
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
+                            },
+                            outbound_send_timeout,
+                        )
+                        .await
+                        .map_err(|error| {
+                            anyhow::anyhow!("failed to send ForwardAccepted: {error}")
+                        })?;
                     }
-                    Err(mpsc::error::TrySendError::Full(q)) => {
+                    Err(mpsc::error::TrySendError::Full(DispatcherJob::Forward(q))) => {
+                        let q = *q;
                         metrics::counter!(
                             "connector_forward_reject_total",
                             "connector" => connector_id.to_string(),
@@ -766,15 +893,36 @@ async fn run_tunnel_once(
                             .expect("connector cancellation map poisoned")
                             .remove(&attempt_key(&q.req));
                         let resp = accept_queue_saturated_response(&q.req);
-                        if out_tx
-                            .send(TunnelMessage {
+                        send_outbound_message(
+                            &out_tx,
+                            TunnelMessage {
                                 payload: Some(tunnel_message::Payload::Response(resp)),
-                            })
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
+                            },
+                            outbound_send_timeout,
+                        )
+                        .await
+                        .map_err(|error| {
+                            anyhow::anyhow!("failed to send accept-queue rejection: {error}")
+                        })?;
+                    }
+                    Err(mpsc::error::TrySendError::Full(DispatcherJob::HealthProbe(_))) => {
+                        unreachable!("forward enqueue returned a health-probe job")
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => break,
+                }
+            }
+            Some(tunnel_message::Payload::HealthProbe(probe)) => {
+                if probe.stream_epoch != stream_epoch || probe.probe_id.is_empty() {
+                    anyhow::bail!("health probe does not match active Connector stream");
+                }
+                match job_tx.try_send(DispatcherJob::HealthProbe(probe)) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        // Intentionally do not bypass the dispatcher with an
+                        // immediate ACK. The Agent timeout will revoke a
+                        // Connector whose real accept/dispatch path is stuck.
+                        metrics::counter!("connector_health_probe_total", "result" => "queue_full")
+                            .increment(1);
                     }
                     Err(mpsc::error::TrySendError::Closed(_)) => break,
                 }
@@ -817,9 +965,12 @@ async fn run_tunnel_once(
                     }
                 }
             }
-            _ => anyhow::bail!("invalid Agent-to-Connector stream message"),
+                _ => anyhow::bail!("invalid Agent-to-Connector stream message"),
+            }
         }
+        Ok(())
     }
+    .await;
 
     for state in cancellations
         .lock()
@@ -855,7 +1006,10 @@ async fn run_tunnel_once(
         "agent_endpoint" => endpoint.to_string()
     );
     g2.set(0.0);
-    anyhow::bail!("tunnel stream ended")
+    match terminal_result {
+        Ok(()) => anyhow::bail!("tunnel stream ended"),
+        Err(error) => Err(error),
+    }
 }
 
 async fn handle_forward(
@@ -1313,6 +1467,86 @@ mod tests {
         tokio::time::timeout(Duration::from_millis(10), state.cancelled())
             .await
             .expect("late waiter must observe sticky cancellation");
+    }
+
+    #[tokio::test]
+    async fn outbound_send_succeeds_with_available_capacity() {
+        let (tx, mut rx) = mpsc::channel(1);
+        send_outbound_message(
+            &tx,
+            TunnelMessage { payload: None },
+            Duration::from_millis(50),
+        )
+        .await
+        .unwrap();
+
+        assert!(rx.recv().await.is_some());
+    }
+
+    #[tokio::test]
+    async fn outbound_send_reports_closed_stream() {
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+
+        assert_eq!(
+            send_outbound_message(
+                &tx,
+                TunnelMessage { payload: None },
+                Duration::from_millis(50),
+            )
+            .await,
+            Err(OutboundSendError::Closed)
+        );
+    }
+
+    #[tokio::test]
+    async fn outbound_send_times_out_when_channel_stays_full() {
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.try_send(TunnelMessage { payload: None }).unwrap();
+
+        assert_eq!(
+            send_outbound_message(
+                &tx,
+                TunnelMessage { payload: None },
+                Duration::from_millis(10),
+            )
+            .await,
+            Err(OutboundSendError::TimedOut)
+        );
+
+        assert!(rx.recv().await.is_some());
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn health_probe_crosses_dispatcher_queue_before_ack_without_http_upstream() {
+        let (job_tx, mut job_rx) = mpsc::channel(1);
+        let (out_tx, mut out_rx) = mpsc::channel(1);
+        job_tx
+            .try_send(DispatcherJob::HealthProbe(HealthProbe {
+                probe_id: "probe-1".into(),
+                stream_epoch: "epoch-1".into(),
+                sent_unix_ms: now_ms(),
+            }))
+            .unwrap();
+
+        let job = job_rx.recv().await.unwrap();
+        let DispatcherJob::HealthProbe(probe) = job else {
+            panic!("probe must remain a dedicated dispatcher job");
+        };
+        send_health_probe_ack(&out_tx, probe, Duration::from_millis(50))
+            .await
+            .unwrap();
+
+        let ack = match out_rx.recv().await.unwrap().payload {
+            Some(tunnel_message::Payload::HealthProbeAck(ack)) => ack,
+            other => panic!("expected HealthProbeAck, got {other:?}"),
+        };
+        assert_eq!(ack.probe_id, "probe-1");
+        assert_eq!(ack.stream_epoch, "epoch-1");
     }
 
     #[test]

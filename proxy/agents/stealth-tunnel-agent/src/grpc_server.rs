@@ -30,6 +30,14 @@ use crate::connector_registry::{ConnectorRegistry, PendingFailure};
 use crate::degrade_redis::{AgentDegradeRedis, StalePolicyPayload};
 use crate::manager::TunnelManager;
 
+const HEALTH_PROBE_CAPABILITY: &str = "health-probe-v1";
+
+fn supports_health_probe(capabilities: &[String]) -> bool {
+    capabilities
+        .iter()
+        .any(|capability| capability == HEALTH_PROBE_CAPABILITY)
+}
+
 #[derive(Debug)]
 struct RegisteredConnectorSession {
     endpoint: String,
@@ -161,6 +169,47 @@ fn now_ms() -> i64 {
 fn remaining_until(deadline_unix_ms: i64) -> Option<Duration> {
     let remaining_ms = deadline_unix_ms.saturating_sub(now_ms());
     (remaining_ms > 0).then(|| Duration::from_millis(remaining_ms as u64))
+}
+
+fn outcome_unknown_deadline(message: &'static str) -> Status {
+    let mut status = Status::deadline_exceeded(message);
+    status
+        .metadata_mut()
+        .insert("x-sag-outcome", "unknown".parse().expect("static metadata"));
+    status
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamSendOutcome {
+    Sent,
+    DownstreamClosed,
+    Revoked,
+    TimedOut,
+}
+
+async fn send_stream_message_bounded(
+    stream_tx: &mpsc::Sender<Result<TunnelMessage, Status>>,
+    close_rx: &mut watch::Receiver<bool>,
+    message: TunnelMessage,
+    timeout: Duration,
+) -> StreamSendOutcome {
+    tokio::select! {
+        biased;
+        changed = close_rx.changed() => {
+            if changed.is_err() || *close_rx.borrow() {
+                StreamSendOutcome::Revoked
+            } else {
+                StreamSendOutcome::DownstreamClosed
+            }
+        }
+        result = tokio::time::timeout(timeout, stream_tx.send(Ok(message))) => {
+            match result {
+                Ok(Ok(())) => StreamSendOutcome::Sent,
+                Ok(Err(_)) => StreamSendOutcome::DownstreamClosed,
+                Err(_) => StreamSendOutcome::TimedOut,
+            }
+        }
+    }
 }
 
 fn is_mutating_method(method: &str) -> bool {
@@ -1117,6 +1166,13 @@ impl TunnelService for StealthTunnelGrpcService {
         });
         let mut inbound = request.into_inner();
         let stream_buf = self.config.read().await.stream_buffer;
+        let stream_send_timeout = Duration::from_millis(
+            std::env::var("SAG_AGENT_STREAM_SEND_TIMEOUT_MS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(1_000)
+                .clamp(1, 30_000),
+        );
         let (outbound_tx, mut outbound_rx) = mpsc::channel::<TunnelMessage>(stream_buf);
         let (stream_tx, stream_rx) = mpsc::channel::<Result<TunnelMessage, Status>>(stream_buf);
         let (close_tx, mut close_rx) = watch::channel(false);
@@ -1171,6 +1227,24 @@ impl TunnelService for StealthTunnelGrpcService {
                                                 "Connector registration rejected"
                                             );
                                             let _ = stream_tx.try_send(Err(Status::permission_denied(reason)));
+                                            break;
+                                        }
+                                        if config.read().await.connector_probe_enabled
+                                            && !supports_health_probe(&reg.capabilities)
+                                        {
+                                            metrics::counter!(
+                                                "agent_connector_registration_rejected_total",
+                                                "reason" => "probe_capability"
+                                            )
+                                            .increment(1);
+                                            warn!(
+                                                connector_id = %reg.connector_id,
+                                                endpoint = %reg.endpoint,
+                                                "Connector registration lacks required health-probe-v1 capability"
+                                            );
+                                            let _ = stream_tx.try_send(Err(Status::failed_precondition(
+                                                "Connector must support health-probe-v1",
+                                            )));
                                             break;
                                         }
                                         let ack = TunnelMessage {
@@ -1276,6 +1350,30 @@ impl TunnelService for StealthTunnelGrpcService {
                                             break;
                                         }
                                     }
+                                    Some(tunnel_message::Payload::HealthProbeAck(ack)) => {
+                                        let Some(session) = registered.as_ref() else {
+                                            let _ = stream_tx.try_send(Err(Status::failed_precondition(
+                                                "Connector must Register before HealthProbeAck",
+                                            )));
+                                            break;
+                                        };
+                                        if !registry.resolve_probe_ack(
+                                            session.generation,
+                                            &session.stream_epoch,
+                                            ack,
+                                        ) {
+                                            metrics::counter!(
+                                                "agent_connector_probe_ack_rejected_total"
+                                            )
+                                            .increment(1);
+                                            debug!(
+                                                connector_id = %session.connector_id,
+                                                endpoint = %session.endpoint,
+                                                generation = session.generation,
+                                                "late or mismatched Connector health probe ACK discarded"
+                                            );
+                                        }
+                                    }
                                     _ => {
                                         warn!("Connector stream sent an invalid client-to-Agent message");
                                         let _ = stream_tx.try_send(Err(Status::invalid_argument(
@@ -1299,9 +1397,30 @@ impl TunnelService for StealthTunnelGrpcService {
                     out = outbound_rx.recv() => {
                         match out {
                             Some(msg) => {
-                                if stream_tx.send(Ok(msg)).await.is_err() {
-                                    warn!("connector_stream_downstream_closed: outbound send failed (peer reset, full buffer, or client disconnect)");
-                                    break;
+                                match send_stream_message_bounded(
+                                    &stream_tx,
+                                    &mut close_rx,
+                                    msg,
+                                    stream_send_timeout,
+                                ).await {
+                                    StreamSendOutcome::Sent => {}
+                                    StreamSendOutcome::Revoked => {
+                                        warn!("Connector stream send interrupted by session revocation");
+                                        break;
+                                    }
+                                    StreamSendOutcome::DownstreamClosed => {
+                                        warn!("connector_stream_downstream_closed: outbound send failed (peer reset or client disconnect)");
+                                        break;
+                                    }
+                                    StreamSendOutcome::TimedOut => {
+                                        metrics::counter!("agent_connector_stream_send_timeout_total")
+                                            .increment(1);
+                                        warn!(
+                                            timeout_ms = stream_send_timeout.as_millis(),
+                                            "Connector stream outbound send timed out"
+                                        );
+                                        break;
+                                    }
                                 }
                             }
                             None => break,
@@ -1521,9 +1640,15 @@ impl TunnelService for StealthTunnelGrpcService {
         // arrives, cancellation cannot prove that downstream never reserved it.
         idempotency_dispatch_guard.disarm_release();
 
-        let acceptance_remaining = remaining_until(req.deadline_unix_ms).ok_or_else(|| {
-            Status::deadline_exceeded("request deadline expired before connector acceptance")
-        })?;
+        let Some(acceptance_remaining) = remaining_until(req.deadline_unix_ms) else {
+            pending.revoke_session("acceptance_deadline_elapsed");
+            if let Some(context) = idempotency_context.as_mut() {
+                self.persist_idempotency_indeterminate(context).await;
+            }
+            return Err(outcome_unknown_deadline(
+                "request deadline expired before connector acceptance",
+            ));
+        };
         match tokio::time::timeout(acceptance_remaining, pending.wait_for_acceptance()).await {
             Ok(true) => {
                 if let Some(context) = idempotency_context.as_mut() {
@@ -1543,22 +1668,25 @@ impl TunnelService for StealthTunnelGrpcService {
                 // handled below as an unknown outcome.
             }
             Err(_) => {
+                pending.revoke_session("acceptance_timeout");
                 if let Some(context) = idempotency_context.as_mut() {
                     self.persist_idempotency_indeterminate(context).await;
                 }
-                let mut status = Status::deadline_exceeded(
+                return Err(outcome_unknown_deadline(
                     "request deadline expired waiting for connector acceptance",
-                );
-                status
-                    .metadata_mut()
-                    .insert("x-sag-outcome", "unknown".parse().expect("static metadata"));
-                return Err(status);
+                ));
             }
         }
 
-        let response_remaining = remaining_until(req.deadline_unix_ms).ok_or_else(|| {
-            Status::deadline_exceeded("request deadline expired before connector wait")
-        })?;
+        let Some(response_remaining) = remaining_until(req.deadline_unix_ms) else {
+            pending.revoke_session("response_deadline_elapsed");
+            if let Some(context) = idempotency_context.as_mut() {
+                self.persist_idempotency_indeterminate(context).await;
+            }
+            return Err(outcome_unknown_deadline(
+                "request deadline expired before connector wait",
+            ));
+        };
         let out = tokio::time::timeout(response_remaining, pending.recv()).await;
 
         let result = match out {
@@ -1636,6 +1764,7 @@ impl TunnelService for StealthTunnelGrpcService {
                 Err(status)
             }
             Err(_) => {
+                pending.revoke_session("response_timeout");
                 if let Some(context) = idempotency_context.as_mut() {
                     self.persist_idempotency_indeterminate(context).await;
                 }
@@ -1652,11 +1781,7 @@ impl TunnelService for StealthTunnelGrpcService {
                     deadline_unix_ms = req.deadline_unix_ms,
                     "connector response deadline exceeded"
                 );
-                let mut status = Status::deadline_exceeded("connector response timeout");
-                status
-                    .metadata_mut()
-                    .insert("x-sag-outcome", "unknown".parse().expect("static metadata"));
-                Err(status)
+                Err(outcome_unknown_deadline("connector response timeout"))
             }
         };
         drop(pending);
@@ -1843,5 +1968,87 @@ mod tests {
             "connector-1",
             "old-epoch"
         ));
+    }
+
+    #[test]
+    fn probe_capability_is_explicitly_negotiated_for_safe_rollout() {
+        assert!(supports_health_probe(&["health-probe-v1".into()]));
+        assert!(!supports_health_probe(&[]));
+        assert!(!supports_health_probe(&["another-capability".into()]));
+    }
+
+    #[test]
+    fn deadline_after_connector_dispatch_is_marked_outcome_unknown() {
+        let status = outcome_unknown_deadline("connector response timeout");
+
+        assert_eq!(status.code(), tonic::Code::DeadlineExceeded);
+        assert_eq!(
+            status
+                .metadata()
+                .get("x-sag-outcome")
+                .and_then(|value| value.to_str().ok()),
+            Some("unknown")
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_stream_send_handles_success_timeout_revocation_and_receiver_close() {
+        let (stream_tx, mut stream_rx) = mpsc::channel::<Result<TunnelMessage, Status>>(1);
+        let (_close_tx, mut close_rx) = watch::channel(false);
+        assert_eq!(
+            send_stream_message_bounded(
+                &stream_tx,
+                &mut close_rx,
+                TunnelMessage { payload: None },
+                Duration::from_secs(1),
+            )
+            .await,
+            StreamSendOutcome::Sent
+        );
+        assert!(stream_rx.recv().await.is_some());
+
+        stream_tx
+            .send(Ok(TunnelMessage { payload: None }))
+            .await
+            .unwrap();
+        assert_eq!(
+            send_stream_message_bounded(
+                &stream_tx,
+                &mut close_rx,
+                TunnelMessage { payload: None },
+                Duration::from_millis(5),
+            )
+            .await,
+            StreamSendOutcome::TimedOut
+        );
+        assert!(stream_rx.recv().await.is_some());
+
+        let (revoked_tx, _revoked_rx) = mpsc::channel::<Result<TunnelMessage, Status>>(1);
+        let (revoke, mut revoked_close_rx) = watch::channel(false);
+        revoke.send(true).unwrap();
+        assert_eq!(
+            send_stream_message_bounded(
+                &revoked_tx,
+                &mut revoked_close_rx,
+                TunnelMessage { payload: None },
+                Duration::from_secs(1),
+            )
+            .await,
+            StreamSendOutcome::Revoked
+        );
+
+        let (closed_tx, closed_rx) = mpsc::channel::<Result<TunnelMessage, Status>>(1);
+        drop(closed_rx);
+        let (_closed_signal, mut closed_close_rx) = watch::channel(false);
+        assert_eq!(
+            send_stream_message_bounded(
+                &closed_tx,
+                &mut closed_close_rx,
+                TunnelMessage { payload: None },
+                Duration::from_secs(1),
+            )
+            .await,
+            StreamSendOutcome::DownstreamClosed
+        );
     }
 }

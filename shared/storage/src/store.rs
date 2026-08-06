@@ -439,6 +439,11 @@ pub async fn ensure_store_schema(store: &StorageStore) -> Result<(), StorageErro
                     "../../../infra/migrations/postgres/004_idempotency_reconciliation.sql"
                 ))
                 .await?;
+            client
+                .batch_execute(include_str!(
+                    "../../../infra/migrations/postgres/005_config_convergence.sql"
+                ))
+                .await?;
             Ok(())
         }
     }

@@ -279,4 +279,51 @@ impl RoutesStore {
             }
         }
     }
+
+    pub async fn load_all_intranet_upstreams(
+        store: &StorageStore,
+    ) -> Result<Vec<IntranetUpstreamRecord>, StorageError> {
+        match store {
+            StorageStore::Sqlite(sqlite) => {
+                let store = sqlite.clone();
+                tokio::task::spawn_blocking(move || {
+                    let connection = rusqlite::Connection::open(store.path())?;
+                    let mut statement = connection.prepare(
+                        "SELECT app_id, upstream, scheme FROM intranet_upstreams ORDER BY app_id",
+                    )?;
+                    let rows = statement.query_map([], |row| {
+                        Ok(IntranetUpstreamRecord {
+                            app_id: row.get(0)?,
+                            upstream: row.get(1)?,
+                            scheme: row.get(2)?,
+                        })
+                    })?;
+                    let mut upstreams = Vec::new();
+                    for row in rows {
+                        upstreams.push(row?);
+                    }
+                    Ok::<_, StorageError>(upstreams)
+                })
+                .await
+                .map_err(|error| StorageError::Task(error.to_string()))?
+            }
+            StorageStore::Postgres(postgres) => {
+                let client = postgres.client().await?;
+                let rows = client
+                    .query(
+                        "SELECT app_id, upstream, scheme FROM intranet_upstreams ORDER BY app_id",
+                        &[],
+                    )
+                    .await?;
+                Ok(rows
+                    .into_iter()
+                    .map(|row| IntranetUpstreamRecord {
+                        app_id: row.get(0),
+                        upstream: row.get(1),
+                        scheme: row.get(2),
+                    })
+                    .collect())
+            }
+        }
+    }
 }

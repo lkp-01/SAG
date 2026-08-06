@@ -2,14 +2,13 @@ mod apisix;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::Request;
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::IntoResponse;
 #[allow(unused_imports)]
@@ -23,8 +22,9 @@ use shared_storage::{
     build_store_from_env, ensure_store_schema, redact_postgres_dsn, resolve_postgres_dsn,
     resolve_storage_backend, ApiRouteRecord, ApiRoutesStore, AppMetricMinuteRecord,
     AppMetricsStore, AppRecord, AppsStore, AuditLogFilter, AuditLogRecord, AuditLogsStore,
-    AuditWriter, FaultEventFilter, FaultEventRecord, FaultEventsStore, IdempotencyRecord,
-    IdempotencyStore, IntranetUpstreamRecord, RoutesStore, SecurityMutation, StorageBackend,
+    AuditWriter, ConfigSyncJob, ConfigSyncJobDraft, ConfigSyncOperation, ConfigSyncStore,
+    FaultEventFilter, FaultEventRecord, FaultEventsStore, IdempotencyRecord, IdempotencyStore,
+    IntranetUpstreamRecord, RoutesStore, SecurityMutation, StorageBackend, StorageError,
     StorageStore, TunnelRouteRecord, UsersStore,
 };
 use tokio::sync::RwLock;
@@ -39,9 +39,8 @@ struct AppState {
     apisix: Option<apisix::ApisixPushConfig>,
     metrics: metrics_exporter_prometheus::PrometheusHandle,
     fault_toggle: Arc<RwLock<FaultInjectionToggle>>,
-    route_cache: Arc<Cache<String, Vec<TunnelRouteRecordDto>>>,
+    route_cache: Arc<Cache<String, RouteCacheEntry>>,
     route_cache_enabled: bool,
-    route_cache_version: Arc<AtomicU64>,
     readiness: Readiness,
 }
 
@@ -420,6 +419,23 @@ struct TunnelRouteRecordDto {
     require_healthy_tunnel: bool,
 }
 
+#[derive(Debug, Clone)]
+struct RouteCacheEntry {
+    generation: i64,
+    routes: Vec<TunnelRouteRecordDto>,
+}
+
+type RouteListResponse = (HeaderMap, Json<Vec<TunnelRouteRecordDto>>);
+
+#[derive(Debug, Deserialize)]
+struct AgentConfigAckDto {
+    agent_id: String,
+    applied_generation: u64,
+    applied_at_ms: i64,
+    #[serde(default)]
+    snapshot_hash: Option<String>,
+}
+
 fn default_require_healthy() -> bool {
     true
 }
@@ -756,14 +772,6 @@ async fn upsert_api_route(
     )
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    // Keep existing APISIX sync chain: route changes imply app should be synced.
-    apisix::try_sync_app(
-        &state.http,
-        state.apisix.as_ref(),
-        &state.store,
-        &body.app_id,
-    )
-    .await;
     Ok(StatusCode::CREATED)
 }
 
@@ -1199,10 +1207,355 @@ fn now_epoch_ms() -> i64 {
         .unwrap_or(0)
 }
 
+async fn validate_persisted_route_configuration(store: &StorageStore) -> anyhow::Result<()> {
+    let routes = RoutesStore::load_all(store).await?;
+    let upstreams = RoutesStore::load_all_intranet_upstreams(store).await?;
+    shared_storage::validate_route_configuration_snapshot(&routes, &upstreams).map_err(|error| {
+        anyhow::anyhow!(
+            "persisted route configuration is unsafe; repair it before starting control-plane convergence: {error}"
+        )
+    })
+}
+
 fn parse_bool_env(name: &str, default: bool) -> bool {
     std::env::var(name)
         .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
         .unwrap_or(default)
+}
+
+fn config_sync_retry_delay_ms(attempt_count: i64, job_id: &str) -> i64 {
+    let exponent = attempt_count.saturating_sub(1).clamp(0, 6) as u32;
+    let base = 1_000_i64.saturating_mul(1_i64 << exponent).min(60_000);
+    let jitter = job_id.bytes().fold(0_u64, |acc, byte| {
+        acc.wrapping_mul(31).wrapping_add(byte as u64)
+    }) % 251;
+    base + jitter as i64
+}
+
+async fn apply_config_sync_job(
+    http: &reqwest::Client,
+    apisix_cfg: &apisix::ApisixPushConfig,
+    store: &StorageStore,
+    job: &ConfigSyncJob,
+) -> anyhow::Result<()> {
+    if job.target != "APISIX" {
+        anyhow::bail!(
+            "unsupported config sync target {}/{} for job {}",
+            job.target,
+            job.resource_type,
+            job.job_id
+        );
+    }
+    let applied_operation = match job.resource_type.as_str() {
+        "ROUTE" => apisix::converge_app_route(http, apisix_cfg, store, &job.app_id).await?,
+        "ROUTE_ID" if job.operation == ConfigSyncOperation::Delete => {
+            // Establish the current deterministic route (or its desired
+            // absence) before removing a legacy/extra ID. Together with the
+            // app-scoped lease this prevents a tombstone from creating a gap
+            // or racing a recreate onto the new ID.
+            let converged =
+                apisix::converge_app_route(http, apisix_cfg, store, &job.app_id).await?;
+            if apisix::route_id_for_app(&job.app_id) != job.resource_id {
+                apisix::delete_route_by_id_for_app(http, apisix_cfg, &job.resource_id, &job.app_id)
+                    .await?;
+                "DELETE"
+            } else {
+                converged
+            }
+        }
+        _ => anyhow::bail!(
+            "unsupported config sync resource type/operation {}/{} for job {}",
+            job.resource_type,
+            job.operation.as_str(),
+            job.job_id
+        ),
+    };
+    if applied_operation != job.operation.as_str() {
+        info!(
+            job_id = %job.job_id,
+            recorded_operation = job.operation.as_str(),
+            applied_operation,
+            "config sync job was reconciled to newer control-plane intent"
+        );
+    }
+    Ok(())
+}
+
+async fn run_config_sync_worker(
+    store: StorageStore,
+    http: reqwest::Client,
+    apisix_cfg: apisix::ApisixPushConfig,
+) {
+    let worker_id = format!("control-plane-admin:{}", uuid::Uuid::new_v4());
+    let poll_ms = std::env::var("SAG_CONFIG_SYNC_POLL_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(500)
+        .max(100);
+    let batch_size = std::env::var("SAG_CONFIG_SYNC_BATCH_SIZE")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(10)
+        .clamp(1, 100);
+    let operation_timeout_ms = std::env::var("SAG_CONFIG_SYNC_OPERATION_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(10_000)
+        .clamp(1_000, 60_000);
+    let operation_timeout = Duration::from_millis(operation_timeout_ms);
+    let unknown_outcome_isolation_ms =
+        std::env::var("SAG_CONFIG_SYNC_UNKNOWN_OUTCOME_ISOLATION_MS")
+            .ok()
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(60_000)
+            .clamp(10_000, 300_000);
+    // Work is claimed one job at a time, immediately before its external I/O.
+    // A failed/timed-out external write keeps this lease for the full isolation
+    // period. Successful operations release it immediately.
+    let lease_ms =
+        (operation_timeout.as_millis() as i64).saturating_add(unknown_outcome_isolation_ms);
+    let mut interval = tokio::time::interval(Duration::from_millis(poll_ms));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        interval.tick().await;
+        for _ in 0..batch_size {
+            let mut claimed = match ConfigSyncStore::claim_due_jobs(
+                &store,
+                &worker_id,
+                now_epoch_ms(),
+                lease_ms,
+                1,
+            )
+            .await
+            {
+                Ok(jobs) => jobs,
+                Err(error) => {
+                    warn!(%error, "config sync job claim failed");
+                    metrics::counter!("config_sync_worker_errors_total", "stage" => "claim")
+                        .increment(1);
+                    break;
+                }
+            };
+            let Some(job) = claimed.pop() else {
+                break;
+            };
+            let result = tokio::time::timeout(
+                operation_timeout,
+                apply_config_sync_job(&http, &apisix_cfg, &store, &job),
+            )
+            .await;
+            match result {
+                Ok(Ok(())) => {
+                    match ConfigSyncStore::mark_applied(
+                        &store,
+                        &job.job_id,
+                        &worker_id,
+                        now_epoch_ms(),
+                    )
+                    .await
+                    {
+                        Ok(true) => {
+                            metrics::counter!("config_sync_jobs_total", "status" => "applied")
+                                .increment(1);
+                        }
+                        Ok(false) => {
+                            warn!(
+                                job_id = %job.job_id,
+                                "config sync result was superseded or its lease was lost"
+                            );
+                            if let Err(error) = ConfigSyncStore::release_lease(
+                                &store,
+                                &job.job_id,
+                                &worker_id,
+                                now_epoch_ms(),
+                            )
+                            .await
+                            {
+                                warn!(job_id = %job.job_id, %error, "failed to release superseded config sync lease");
+                            }
+                        }
+                        Err(error) => {
+                            warn!(job_id = %job.job_id, %error, "failed to mark config sync job applied")
+                        }
+                    }
+                }
+                outcome => {
+                    let error = match outcome {
+                        Ok(Err(error)) => error.to_string(),
+                        Err(_) => format!(
+                            "APISIX operation exceeded {}ms",
+                            operation_timeout.as_millis()
+                        ),
+                        Ok(Ok(())) => unreachable!(),
+                    };
+                    let failed_at_ms = now_epoch_ms();
+                    let next_attempt_at_ms = failed_at_ms
+                        .saturating_add(config_sync_retry_delay_ms(job.attempt_count, &job.job_id));
+                    match ConfigSyncStore::mark_failed_retaining_lease(
+                        &store,
+                        &job.job_id,
+                        &worker_id,
+                        &error,
+                        failed_at_ms,
+                        next_attempt_at_ms,
+                    )
+                    .await
+                    {
+                        Ok(true) => {
+                            metrics::counter!(
+                                "config_sync_jobs_total",
+                                "status" => "outcome_unknown"
+                            )
+                            .increment(1);
+                            warn!(
+                                job_id = %job.job_id,
+                                app_id = %job.app_id,
+                                attempt = job.attempt_count,
+                                retry_at_ms = next_attempt_at_ms,
+                                quarantine_until_ms = ?job.lease_expires_at_ms,
+                                %error,
+                                "config sync job external outcome may be unknown; app lease retained for isolation"
+                            );
+                        }
+                        Ok(false) => {
+                            warn!(
+                                job_id = %job.job_id,
+                                %error,
+                                "failed config sync result was superseded or its lease was lost; retaining the lease until expiry because the external outcome may be unknown"
+                            );
+                        }
+                        Err(store_error) => warn!(
+                            job_id = %job.job_id,
+                            error = %store_error,
+                            "failed to persist config sync failure"
+                        ),
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn reconcile_apisix_managed_routes(state: &AppState) {
+    let Some(apisix_cfg) = state.apisix.as_ref() else {
+        return;
+    };
+    let generation_before = match ConfigSyncStore::current_generation(&state.store).await {
+        Ok(generation) => generation,
+        Err(error) => {
+            warn!(%error, "APISIX reconciliation could not read desired generation");
+            return;
+        }
+    };
+    let drift = match apisix::inspect_managed_route_drift(&state.http, apisix_cfg, &state.store)
+        .await
+    {
+        Ok(drift) => drift,
+        Err(error) => {
+            metrics::counter!("apisix_reconcile_errors_total", "stage" => "inspect").increment(1);
+            warn!(%error, "APISIX actual-state reconciliation inspection failed");
+            return;
+        }
+    };
+    let generation_after = match ConfigSyncStore::current_generation(&state.store).await {
+        Ok(generation) => generation,
+        Err(error) => {
+            warn!(%error, "APISIX reconciliation could not recheck desired generation");
+            return;
+        }
+    };
+    if generation_before != generation_after {
+        metrics::counter!("apisix_reconcile_skipped_total", "reason" => "generation_changed")
+            .increment(1);
+        info!(
+            generation_before,
+            generation_after,
+            "APISIX reconciliation skipped a snapshot that changed during inspection"
+        );
+        return;
+    }
+    metrics::gauge!("config_desired_generation").set(generation_after as f64);
+
+    let drift_count = drift.upsert_app_ids.len() + drift.delete_routes.len();
+    metrics::gauge!("apisix_managed_route_drift").set(drift_count as f64);
+    if drift_count > 0 {
+        warn!(
+            upsert_count = drift.upsert_app_ids.len(),
+            delete_count = drift.delete_routes.len(),
+            "APISIX managed route drift detected"
+        );
+    }
+
+    let queued_at_ms = now_epoch_ms();
+    let mut action_failed = false;
+    for app_id in drift.upsert_app_ids {
+        let draft = ConfigSyncJobDraft {
+            generation: generation_after,
+            target: "APISIX".into(),
+            resource_type: "ROUTE".into(),
+            resource_id: app_id.clone(),
+            app_id: app_id.clone(),
+            operation: ConfigSyncOperation::Upsert,
+            payload_json: None,
+            next_attempt_at_ms: queued_at_ms,
+        };
+        match ConfigSyncStore::requeue_job(&state.store, &draft, queued_at_ms).await {
+            Ok(true) => {
+                metrics::counter!("apisix_reconcile_actions_total", "operation" => "upsert", "status" => "queued").increment(1);
+            }
+            Ok(false) => {
+                metrics::counter!("apisix_reconcile_actions_total", "operation" => "upsert", "status" => "inflight").increment(1);
+            }
+            Err(error) => {
+                action_failed = true;
+                metrics::counter!("apisix_reconcile_actions_total", "operation" => "upsert", "status" => "failed").increment(1);
+                warn!(%app_id, %error, "failed to enqueue APISIX reconciliation upsert");
+            }
+        }
+    }
+    for deletion in drift.delete_routes {
+        let route_id = deletion.route_id;
+        let Some(app_id) = deletion.app_id else {
+            warn!(%route_id, "owned APISIX route lacks sag-app-id; refusing reconciliation delete");
+            continue;
+        };
+        let deterministic_id = apisix::route_id_for_app(&app_id);
+        let (resource_type, resource_id) = if deterministic_id == route_id {
+            ("ROUTE", app_id.clone())
+        } else {
+            ("ROUTE_ID", route_id.clone())
+        };
+        let draft = ConfigSyncJobDraft {
+            generation: generation_after,
+            target: "APISIX".into(),
+            resource_type: resource_type.into(),
+            resource_id,
+            app_id: app_id.clone(),
+            operation: ConfigSyncOperation::Delete,
+            payload_json: None,
+            next_attempt_at_ms: queued_at_ms,
+        };
+        match ConfigSyncStore::requeue_job(&state.store, &draft, queued_at_ms).await {
+            Ok(true) => {
+                metrics::counter!("apisix_reconcile_actions_total", "operation" => "delete", "status" => "queued").increment(1);
+            }
+            Ok(false) => {
+                metrics::counter!("apisix_reconcile_actions_total", "operation" => "delete", "status" => "inflight").increment(1);
+            }
+            Err(error) => {
+                action_failed = true;
+                metrics::counter!("apisix_reconcile_actions_total", "operation" => "delete", "status" => "failed").increment(1);
+                warn!(%route_id, %app_id, %error, "failed to enqueue APISIX reconciliation delete");
+            }
+        }
+    }
+    if action_failed {
+        metrics::counter!("apisix_reconcile_errors_total", "stage" => "queue").increment(1);
+    } else {
+        metrics::gauge!("apisix_reconcile_last_success_timestamp_seconds")
+            .set(now_epoch_ms() as f64 / 1_000.0);
+    }
 }
 
 fn fault_injection_env_enabled() -> bool {
@@ -1522,21 +1875,29 @@ async fn list_routes(
     headers: HeaderMap,
     State(state): State<AppState>,
     Query(q): Query<RoutesQuery>,
-) -> Result<Json<Vec<TunnelRouteRecordDto>>, (StatusCode, String)> {
+) -> Result<RouteListResponse, (StatusCode, String)> {
     let t0 = Instant::now();
     if !has_valid_agent_sync_token(&headers) {
         require_admin_or_boss(&headers, &state.store).await?;
     }
     let filtered_app = q.app_id.clone().unwrap_or_default();
-    let version = state.route_cache_version.load(Ordering::Relaxed);
-    let key = format!("v{version}|app={filtered_app}");
+    let key = format!("app={filtered_app}");
     if state.route_cache_enabled {
-        if let Some(cached) = state.route_cache.get(&key).await {
+        let current_generation = ConfigSyncStore::current_generation(&state.store)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        if let Some(cached) = state
+            .route_cache
+            .get(&key)
+            .await
+            .filter(|entry| entry.generation == current_generation)
+        {
+            metrics::gauge!("config_desired_generation").set(current_generation as f64);
             let hit = metrics::counter!("cache_hit_total", "service" => "control-plane-admin", "cache" => "agent_routes");
             hit.increment(1);
             let rate = metrics::counter!("route_cache_hit_rate", "result" => "hit");
             rate.increment(1);
-            return Ok(Json(cached));
+            return route_snapshot_response(cached);
         }
         let miss = metrics::counter!("cache_miss_total", "service" => "control-plane-admin", "cache" => "agent_routes");
         miss.increment(1);
@@ -1544,14 +1905,15 @@ async fn list_routes(
         rate.increment(1);
     }
 
-    let load_routes = || async {
-        let mut rows = RoutesStore::load_all(&state.store)
+    let load_snapshot = || async {
+        let snapshot = ConfigSyncStore::load_route_snapshot(&state.store)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let mut rows = snapshot.routes;
         if !filtered_app.is_empty() {
             rows.retain(|r| r.app_id == filtered_app);
         }
-        let out: Vec<TunnelRouteRecordDto> = rows
+        let routes = rows
             .into_iter()
             .map(|r| TunnelRouteRecordDto {
                 host: r.host,
@@ -1559,33 +1921,166 @@ async fn list_routes(
                 connector_endpoint: r.connector_endpoint,
                 require_healthy_tunnel: r.require_healthy_tunnel,
             })
-            .collect();
-        Ok::<Vec<TunnelRouteRecordDto>, (StatusCode, String)>(out)
+            .collect::<Vec<_>>();
+        Ok::<RouteCacheEntry, (StatusCode, String)>(RouteCacheEntry {
+            generation: snapshot.generation,
+            routes,
+        })
     };
     let out = if state.route_cache_enabled {
-        let fresh = load_routes().await?;
+        let fresh = load_snapshot().await?;
         state.route_cache.insert(key, fresh.clone()).await;
         fresh
     } else {
-        load_routes().await?
+        load_snapshot().await?
     };
     debug_log(
         "control-plane-admin/main.rs:list_routes",
         "list routes completed",
         "H5",
-        serde_json::json!({"count":out.len(),"ms":t0.elapsed().as_millis(),"filtered_app": if filtered_app.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(filtered_app) }}),
+        serde_json::json!({"count":out.routes.len(),"generation":out.generation,"ms":t0.elapsed().as_millis(),"filtered_app": if filtered_app.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(filtered_app) }}),
         "initial",
     );
-    Ok(Json(out))
+    metrics::gauge!("config_desired_generation").set(out.generation as f64);
+    route_snapshot_response(out)
 }
 
-fn bump_route_cache_version(state: &AppState) {
-    state.route_cache_version.fetch_add(1, Ordering::Relaxed);
-    let bump = metrics::counter!("cache_version_bump_total", "service" => "control-plane-admin", "cache" => "agent_routes");
+fn route_snapshot_response(
+    snapshot: RouteCacheEntry,
+) -> Result<RouteListResponse, (StatusCode, String)> {
+    let mut headers = HeaderMap::new();
+    let generation = HeaderValue::from_str(&snapshot.generation.to_string())
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    headers.insert("x-sag-config-generation", generation);
+    Ok((headers, Json(snapshot.routes)))
+}
+
+fn agent_apply_active_window_ms() -> i64 {
+    let seconds = std::env::var("SAG_AGENT_APPLY_ACTIVE_WINDOW_SEC")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(300)
+        .clamp(30, 86_400);
+    i64::try_from(seconds.saturating_mul(1_000)).unwrap_or(i64::MAX)
+}
+
+fn agent_apply_retention_ms() -> i64 {
+    let seconds = std::env::var("SAG_AGENT_APPLY_RETENTION_SEC")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(7 * 24 * 60 * 60)
+        .clamp(300, 365 * 24 * 60 * 60);
+    i64::try_from(seconds.saturating_mul(1_000))
+        .unwrap_or(i64::MAX)
+        .max(agent_apply_active_window_ms())
+}
+
+async fn refresh_agent_apply_metrics(store: &StorageStore, desired_generation: i64) {
+    let active_cutoff_ms = now_epoch_ms().saturating_sub(agent_apply_active_window_ms());
+    match ConfigSyncStore::list_agent_applies(store).await {
+        Ok(applies) => {
+            for apply in applies {
+                let active = apply.reported_at_ms >= active_cutoff_ms;
+                metrics::gauge!("agent_config_ack_active", "agent_id" => apply.agent_id.clone())
+                    .set(if active { 1.0 } else { 0.0 });
+                metrics::gauge!("agent_config_generation_lag", "agent_id" => apply.agent_id)
+                    .set(desired_generation.saturating_sub(apply.applied_generation) as f64);
+            }
+        }
+        Err(error) => warn!(%error, "failed to refresh Agent generation metrics"),
+    }
+}
+
+async fn invalidate_route_cache(state: &AppState) {
+    let bump = metrics::counter!("cache_invalidation_total", "service" => "control-plane-admin", "cache" => "agent_routes");
     bump.increment(1);
     if state.route_cache_enabled {
         state.route_cache.invalidate_all();
     }
+    match ConfigSyncStore::current_generation(&state.store).await {
+        Ok(generation) => {
+            metrics::gauge!("config_desired_generation").set(generation as f64);
+            refresh_agent_apply_metrics(&state.store, generation).await;
+        }
+        Err(error) => warn!(%error, "failed to refresh desired configuration generation metric"),
+    }
+}
+
+async fn ack_routes(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(body): Json<AgentConfigAckDto>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    if !has_valid_agent_sync_token(&headers) {
+        return Err((StatusCode::UNAUTHORIZED, "invalid agent sync token".into()));
+    }
+    let agent_id = body.agent_id.trim();
+    if agent_id.is_empty()
+        || agent_id.len() > 128
+        || !agent_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "agent_id must be 1..=128 ASCII letters, digits, '-', '_', '.', or ':'".into(),
+        ));
+    }
+    if body.applied_at_ms < 0 || body.applied_generation > i64::MAX as u64 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "invalid applied generation or timestamp".into(),
+        ));
+    }
+    if body.snapshot_hash.as_ref().is_some_and(|snapshot_hash| {
+        snapshot_hash.len() != 64
+            || !snapshot_hash
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "snapshot_hash must be 64 lowercase hexadecimal characters".into(),
+        ));
+    }
+    let current_generation = ConfigSyncStore::current_generation(&state.store)
+        .await
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let applied_generation = body.applied_generation as i64;
+    if applied_generation > current_generation {
+        return Err((
+            StatusCode::CONFLICT,
+            format!(
+                "applied_generation {applied_generation} is newer than current generation {current_generation}"
+            ),
+        ));
+    }
+    let stored = ConfigSyncStore::ack_agent_generation(
+        &state.store,
+        agent_id,
+        applied_generation,
+        body.snapshot_hash.as_deref(),
+        body.applied_at_ms,
+        now_epoch_ms(),
+    )
+    .await
+    .map_err(config_mutation_http_error)?;
+    metrics::gauge!("config_desired_generation").set(current_generation as f64);
+    metrics::gauge!("agent_applied_generation", "agent_id" => stored.agent_id.clone())
+        .set(stored.applied_generation as f64);
+    metrics::gauge!("agent_config_ack_active", "agent_id" => stored.agent_id.clone()).set(1.0);
+    metrics::gauge!("agent_config_generation_lag", "agent_id" => stored.agent_id)
+        .set(current_generation.saturating_sub(stored.applied_generation) as f64);
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn config_mutation_http_error(error: StorageError) -> (StatusCode, String) {
+    let status = match &error {
+        StorageError::Validation(_) => StatusCode::BAD_REQUEST,
+        StorageError::Conflict(_) => StatusCode::CONFLICT,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    (status, error.to_string())
 }
 
 async fn post_route(
@@ -1613,15 +2108,8 @@ async fn post_route(
         &audit,
     )
     .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    bump_route_cache_version(&state);
-    apisix::try_sync_app(
-        &state.http,
-        state.apisix.as_ref(),
-        &state.store,
-        &body.app_id,
-    )
-    .await;
+    .map_err(config_mutation_http_error)?;
+    invalidate_route_cache(&state).await;
     Ok(StatusCode::CREATED)
 }
 
@@ -1652,15 +2140,8 @@ async fn put_route(
         &audit,
     )
     .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    bump_route_cache_version(&state);
-    apisix::try_sync_app(
-        &state.http,
-        state.apisix.as_ref(),
-        &state.store,
-        &body.app_id,
-    )
-    .await;
+    .map_err(config_mutation_http_error)?;
+    invalidate_route_cache(&state).await;
     Ok(StatusCode::OK)
 }
 
@@ -1683,8 +2164,8 @@ async fn delete_route(
         &audit,
     )
     .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    bump_route_cache_version(&state);
+    .map_err(config_mutation_http_error)?;
+    invalidate_route_cache(&state).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1699,7 +2180,7 @@ async fn put_intranet_upstream(
     let rec = IntranetUpstreamRecord {
         app_id: q.app_id,
         upstream: body.upstream,
-        scheme: body.scheme,
+        scheme: body.scheme.to_ascii_lowercase(),
     };
     let audit = AuditLogRecord::management(
         "control-plane-admin",
@@ -1714,8 +2195,8 @@ async fn put_intranet_upstream(
         &audit,
     )
     .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    apisix::try_sync_app(&state.http, state.apisix.as_ref(), &state.store, &app_id).await;
+    .map_err(config_mutation_http_error)?;
+    invalidate_route_cache(&state).await;
     Ok(StatusCode::OK)
 }
 
@@ -1842,6 +2323,11 @@ async fn main() -> anyhow::Result<()> {
     let backend = resolve_storage_backend();
     let store = build_store_from_env();
     ensure_store_schema(&store).await?;
+    // Online mutations enforce these invariants, but an in-place upgrade can
+    // inherit rows written by an older version. Fail closed before Agent reads
+    // or APISIX workers start rather than declaring poisoned legacy state
+    // converged.
+    validate_persisted_route_configuration(&store).await?;
     let audit_writer = AuditWriter::from_env(store.clone())?;
     let store_hint = match backend {
         StorageBackend::Sqlite => format!("sqlite:{}", shared_storage::resolve_storage_db_path()),
@@ -1857,18 +2343,48 @@ async fn main() -> anyhow::Result<()> {
     if apisix_cfg.is_some() {
         info!("APISIX Admin push enabled (SAG_APISIX_ADMIN_BASE_URL)");
     }
-    let http = reqwest::Client::builder().build()?;
+    let http_timeout_ms = std::env::var("SAG_CONTROL_PLANE_HTTP_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(8_000)
+        .clamp(100, 60_000);
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_millis(http_timeout_ms))
+        .build()?;
 
     if bootstrap_demo {
-        match RoutesStore::insert_demo_route_if_empty(&store).await {
-            Ok(true) => {
-                info!("SAG_BOOTSTRAP_DEMO_TUNNEL_ROUTE: inserted demo tunnel_routes row (app-001)");
+        match RoutesStore::load_all(&store).await {
+            Ok(routes) if routes.is_empty() => {
+                let route = TunnelRouteRecord {
+                    host: "app.internal.com".into(),
+                    app_id: "app-001".into(),
+                    connector_endpoint: "connector-local-001:stream".into(),
+                    require_healthy_tunnel: true,
+                };
+                let audit = AuditLogRecord::management(
+                    "control-plane-admin",
+                    "system:bootstrap",
+                    "app-001",
+                    "/bootstrap/demo-tunnel-route",
+                    "UPSERT",
+                );
+                if let Err(error) = AuditLogsStore::apply_security_mutation(
+                    &store,
+                    &SecurityMutation::UpsertTunnelRoute(route),
+                    &audit,
+                )
+                .await
+                {
+                    warn!(%error, "SAG_BOOTSTRAP_DEMO_TUNNEL_ROUTE: demo insert failed");
+                } else {
+                    info!("SAG_BOOTSTRAP_DEMO_TUNNEL_ROUTE: inserted demo tunnel_routes row (app-001)");
+                }
             }
-            Ok(false) => {
-                info!("SAG_BOOTSTRAP_DEMO_TUNNEL_ROUTE: tunnel_routes non-empty, skip demo insert");
+            Ok(_) => {
+                info!("SAG_BOOTSTRAP_DEMO_TUNNEL_ROUTE: tunnel_routes non-empty, skip demo insert")
             }
-            Err(e) => {
-                tracing::warn!(%e, "SAG_BOOTSTRAP_DEMO_TUNNEL_ROUTE: demo insert failed");
+            Err(error) => {
+                warn!(%error, "SAG_BOOTSTRAP_DEMO_TUNNEL_ROUTE: route lookup failed");
             }
         }
 
@@ -1884,8 +2400,21 @@ async fn main() -> anyhow::Result<()> {
                     upstream: "mock-workload:18080".to_string(),
                     scheme: "http".to_string(),
                 };
-                if let Err(e) = RoutesStore::upsert_intranet_upstream(&store, &rec).await {
-                    tracing::warn!(%e, "SAG_BOOTSTRAP_DEMO_TUNNEL_ROUTE: intranet upstream insert failed");
+                let audit = AuditLogRecord::management(
+                    "control-plane-admin",
+                    "system:bootstrap",
+                    "app-001",
+                    "/bootstrap/demo-intranet-upstream",
+                    "UPSERT",
+                );
+                if let Err(error) = AuditLogsStore::apply_security_mutation(
+                    &store,
+                    &SecurityMutation::UpsertIntranetUpstream(rec),
+                    &audit,
+                )
+                .await
+                {
+                    warn!(%error, "SAG_BOOTSTRAP_DEMO_TUNNEL_ROUTE: intranet upstream insert failed");
                 } else {
                     info!("SAG_BOOTSTRAP_DEMO_TUNNEL_ROUTE: inserted demo intranet_upstreams row (app-001 -> mock-workload:18080)");
                 }
@@ -1894,13 +2423,7 @@ async fn main() -> anyhow::Result<()> {
                 tracing::warn!(%e, "SAG_BOOTSTRAP_DEMO_TUNNEL_ROUTE: intranet upstream lookup failed");
             }
         }
-
-        apisix::try_sync_app(&http, apisix_cfg.as_ref(), &store, "app-001").await;
     }
-    // Startup reconciliation: ensure all existing app routes in APISIX are aligned
-    // with latest route semantics (app-id vars, rewrite, metrics plugin).
-    apisix::try_sync_all_apps(&http, apisix_cfg.as_ref(), &store).await;
-
     let state = AppState {
         store,
         audit_writer,
@@ -1923,7 +2446,6 @@ async fn main() -> anyhow::Result<()> {
         route_cache_enabled: std::env::var("SAG_ROUTE_CACHE_ENABLED")
             .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
             .unwrap_or(true),
-        route_cache_version: Arc::new(AtomicU64::new(1)),
         readiness: Readiness::new(
             std::env::var("SAG_READINESS_SUCCESS_THRESHOLD")
                 .ok()
@@ -1932,6 +2454,25 @@ async fn main() -> anyhow::Result<()> {
         ),
     };
 
+    match ConfigSyncStore::current_generation(&state.store).await {
+        Ok(generation) => {
+            metrics::gauge!("config_desired_generation").set(generation as f64);
+            refresh_agent_apply_metrics(&state.store, generation).await;
+        }
+        Err(error) => warn!(%error, "failed to initialize desired configuration generation metric"),
+    }
+
+    if let Some(config) = state.apisix.clone() {
+        tokio::spawn(run_config_sync_worker(
+            state.store.clone(),
+            state.http.clone(),
+            config,
+        ));
+        info!("persistent APISIX config sync worker started");
+    } else {
+        warn!("persistent APISIX config sync worker disabled: APISIX admin config missing");
+    }
+
     let bg_state = state.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
@@ -1939,6 +2480,19 @@ async fn main() -> anyhow::Result<()> {
             interval.tick().await;
             if let Err(e) = aggregate_and_persist_app_metrics(&bg_state).await {
                 tracing::warn!(%e, "app metrics aggregation tick failed");
+            }
+            match ConfigSyncStore::current_generation(&bg_state.store).await {
+                Ok(generation) => {
+                    refresh_agent_apply_metrics(&bg_state.store, generation).await;
+                    let cutoff_ms = now_epoch_ms().saturating_sub(agent_apply_retention_ms());
+                    if let Err(error) =
+                        ConfigSyncStore::prune_agent_applies_before(&bg_state.store, cutoff_ms)
+                            .await
+                    {
+                        warn!(%error, "failed to prune expired Agent apply acknowledgements");
+                    }
+                }
+                Err(error) => warn!(%error, "failed to refresh Agent apply activity"),
             }
         }
     });
@@ -1950,23 +2504,39 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(30)
         .max(5);
+    let reconcile_timeout_sec = std::env::var("SAG_APISIX_RECONCILE_TIMEOUT_SEC")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(20)
+        .clamp(5, 300);
     if reconcile_enabled && state.apisix.is_some() {
+        metrics::gauge!("apisix_reconcile_last_success_timestamp_seconds")
+            .set(now_epoch_ms() as f64 / 1_000.0);
         let reconcile_state = state.clone();
         tokio::spawn(async move {
             let mut interval =
                 tokio::time::interval(std::time::Duration::from_secs(reconcile_interval_sec));
             loop {
                 interval.tick().await;
-                apisix::try_sync_all_apps(
-                    &reconcile_state.http,
-                    reconcile_state.apisix.as_ref(),
-                    &reconcile_state.store,
+                if tokio::time::timeout(
+                    Duration::from_secs(reconcile_timeout_sec),
+                    reconcile_apisix_managed_routes(&reconcile_state),
                 )
-                .await;
+                .await
+                .is_err()
+                {
+                    metrics::counter!("apisix_reconcile_errors_total", "stage" => "round_timeout")
+                        .increment(1);
+                    warn!(
+                        timeout_sec = reconcile_timeout_sec,
+                        "APISIX reconciliation round timed out"
+                    );
+                }
             }
         });
         info!(
             interval_sec = reconcile_interval_sec,
+            timeout_sec = reconcile_timeout_sec,
             "apisix periodic reconcile started"
         );
     } else if state.apisix.is_none() {
@@ -2025,6 +2595,7 @@ async fn main() -> anyhow::Result<()> {
             post(release_idempotency_by_operator),
         )
         .route("/api/v1/agent/routes", get(list_routes).post(post_route))
+        .route("/api/v1/agent/routes/ack", post(ack_routes))
         .route(
             "/api/v1/agent/routes/:host",
             put(put_route).delete(delete_route),
@@ -2094,4 +2665,365 @@ async fn main() -> anyhow::Result<()> {
         return Err(error);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use axum::extract::State as AxumState;
+
+    #[test]
+    fn route_snapshot_response_carries_generation_without_changing_json_shape() {
+        let (headers, Json(routes)) = route_snapshot_response(RouteCacheEntry {
+            generation: 42,
+            routes: vec![TunnelRouteRecordDto {
+                host: "app.internal".into(),
+                app_id: "app-001".into(),
+                connector_endpoint: "connector:stream".into(),
+                require_healthy_tunnel: true,
+            }],
+        })
+        .unwrap();
+
+        assert_eq!(headers["x-sag-config-generation"], "42");
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].app_id, "app-001");
+    }
+
+    #[test]
+    fn config_sync_retry_is_bounded_exponential_with_small_jitter() {
+        let first = config_sync_retry_delay_ms(1, "job-a");
+        let seventh = config_sync_retry_delay_ms(7, "job-a");
+        let much_later = config_sync_retry_delay_ms(100, "job-a");
+
+        assert!((1_000..=1_250).contains(&first));
+        assert!((60_000..=60_250).contains(&seventh));
+        assert_eq!(seventh, much_later);
+    }
+
+    #[tokio::test]
+    async fn stale_current_id_tombstone_converges_recreated_route_instead_of_deleting_it() {
+        #[derive(Clone)]
+        struct MockState {
+            put_count: Arc<AtomicUsize>,
+            delete_count: Arc<AtomicUsize>,
+        }
+
+        async fn get_route() -> StatusCode {
+            StatusCode::NOT_FOUND
+        }
+        async fn put_route(AxumState(state): AxumState<MockState>) -> StatusCode {
+            state.put_count.fetch_add(1, Ordering::SeqCst);
+            StatusCode::OK
+        }
+        async fn delete_route(AxumState(state): AxumState<MockState>) -> StatusCode {
+            state.delete_count.fetch_add(1, Ordering::SeqCst);
+            StatusCode::OK
+        }
+
+        let put_count = Arc::new(AtomicUsize::new(0));
+        let delete_count = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route(
+                "/apisix/admin/routes/:route_id",
+                get(get_route).put(put_route).delete(delete_route),
+            )
+            .with_state(MockState {
+                put_count: put_count.clone(),
+                delete_count: delete_count.clone(),
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let db_path = std::env::temp_dir().join(format!(
+            "sag-control-plane-stale-tombstone-{}-{}.db",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let store = StorageStore::Sqlite(shared_storage::SqliteStore::new(
+            db_path.to_string_lossy().to_string(),
+        ));
+        ensure_store_schema(&store).await.unwrap();
+        RoutesStore::upsert(
+            &store,
+            &TunnelRouteRecord {
+                host: "recreated.internal".into(),
+                app_id: "app-1".into(),
+                connector_endpoint: "connector:50051".into(),
+                require_healthy_tunnel: true,
+            },
+        )
+        .await
+        .unwrap();
+        RoutesStore::upsert_intranet_upstream(
+            &store,
+            &IntranetUpstreamRecord {
+                app_id: "app-1".into(),
+                upstream: "upstream:8080".into(),
+                scheme: "http".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let job = ConfigSyncJob {
+            job_id: "stale-delete".into(),
+            generation: 1,
+            target: "APISIX".into(),
+            resource_type: "ROUTE_ID".into(),
+            resource_id: apisix::route_id_for_app("app-1"),
+            app_id: "app-1".into(),
+            operation: ConfigSyncOperation::Delete,
+            payload_json: None,
+            status: shared_storage::ConfigSyncStatus::Pending,
+            attempt_count: 1,
+            next_attempt_at_ms: 0,
+            last_error: None,
+            lease_owner: Some("worker".into()),
+            lease_expires_at_ms: Some(i64::MAX),
+            superseded_by_generation: None,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            applied_at_ms: None,
+        };
+        let cfg = apisix::ApisixPushConfig {
+            admin_base: format!("http://{address}"),
+            admin_key: "test-key".into(),
+        };
+
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        apply_config_sync_job(&client, &cfg, &store, &job)
+            .await
+            .unwrap();
+        assert_eq!(put_count.load(Ordering::SeqCst), 1);
+        assert_eq!(delete_count.load(Ordering::SeqCst), 0);
+
+        server.abort();
+        std::fs::remove_file(db_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn timed_out_apisix_write_quarantines_newer_generation_until_old_lease_expires() {
+        #[derive(Clone)]
+        struct DelayedMockState {
+            started: Arc<AtomicUsize>,
+            completed: Arc<AtomicUsize>,
+            entered: Arc<tokio::sync::Notify>,
+        }
+
+        async fn slow_put_route(AxumState(state): AxumState<DelayedMockState>) -> StatusCode {
+            state.started.fetch_add(1, Ordering::SeqCst);
+            state.entered.notify_one();
+            let completed = state.completed.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(80)).await;
+                completed.fetch_add(1, Ordering::SeqCst);
+            });
+            // Model an upstream which accepted the mutation, continues it
+            // independently, but does not return a response before our client
+            // deadline.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            StatusCode::OK
+        }
+
+        async fn route_not_found() -> StatusCode {
+            StatusCode::NOT_FOUND
+        }
+
+        let started = Arc::new(AtomicUsize::new(0));
+        let completed = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let app = Router::new()
+            .route(
+                "/apisix/admin/routes/:route_id",
+                get(route_not_found).put(slow_put_route),
+            )
+            .with_state(DelayedMockState {
+                started: started.clone(),
+                completed: completed.clone(),
+                entered: entered.clone(),
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let db_path = std::env::temp_dir().join(format!(
+            "sag-control-plane-unknown-outcome-{}-{}.db",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let store = StorageStore::Sqlite(shared_storage::SqliteStore::new(
+            db_path.to_string_lossy().to_string(),
+        ));
+        ensure_store_schema(&store).await.unwrap();
+        RoutesStore::upsert(
+            &store,
+            &TunnelRouteRecord {
+                host: "late-write.internal".into(),
+                app_id: "app-late".into(),
+                connector_endpoint: "connector:50051".into(),
+                require_healthy_tunnel: true,
+            },
+        )
+        .await
+        .unwrap();
+        RoutesStore::upsert_intranet_upstream(
+            &store,
+            &IntranetUpstreamRecord {
+                app_id: "app-late".into(),
+                upstream: "upstream:8080".into(),
+                scheme: "http".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let resource_id = apisix::route_id_for_app("app-late");
+        let first = ConfigSyncStore::enqueue_job(
+            &store,
+            &ConfigSyncJobDraft {
+                generation: 1,
+                target: "APISIX".into(),
+                resource_type: "ROUTE".into(),
+                resource_id: resource_id.clone(),
+                app_id: "app-late".into(),
+                operation: ConfigSyncOperation::Upsert,
+                payload_json: None,
+                next_attempt_at_ms: 10,
+            },
+            10,
+        )
+        .await
+        .unwrap();
+        let claimed = ConfigSyncStore::claim_due_jobs(&store, "worker-old", 10, 200, 1)
+            .await
+            .unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].job_id, first.job_id);
+
+        let cfg = apisix::ApisixPushConfig {
+            admin_base: format!("http://{address}"),
+            admin_key: "test-key".into(),
+        };
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let mut apply = Box::pin(apply_config_sync_job(&client, &cfg, &store, &claimed[0]));
+        let entered_before_completion = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::select! {
+                outcome = &mut apply => Some(outcome),
+                () = entered.notified() => None,
+            }
+        })
+        .await
+        .expect("the APISIX mock must receive the PUT request");
+        assert!(
+            entered_before_completion.is_none(),
+            "the APISIX call unexpectedly completed before entering the delayed PUT"
+        );
+        let result = tokio::time::timeout(Duration::from_millis(20), &mut apply).await;
+        assert!(result.is_err(), "the delayed APISIX write must time out");
+        drop(apply);
+        assert_eq!(started.load(Ordering::SeqCst), 1);
+        assert!(ConfigSyncStore::mark_failed_retaining_lease(
+            &store,
+            &first.job_id,
+            "worker-old",
+            "APISIX operation timed out",
+            30,
+            40,
+        )
+        .await
+        .unwrap());
+
+        ConfigSyncStore::enqueue_job(
+            &store,
+            &ConfigSyncJobDraft {
+                generation: 2,
+                target: "APISIX".into(),
+                resource_type: "ROUTE".into(),
+                resource_id,
+                app_id: "app-late".into(),
+                operation: ConfigSyncOperation::Upsert,
+                payload_json: None,
+                next_attempt_at_ms: 31,
+            },
+            31,
+        )
+        .await
+        .unwrap();
+
+        let prematurely_claimed =
+            ConfigSyncStore::claim_due_jobs(&store, "worker-new", 100, 100, 1)
+                .await
+                .unwrap();
+        assert!(
+            prematurely_claimed.is_empty(),
+            "the old unknown-outcome lease must fence the newer generation"
+        );
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            completed.load(Ordering::SeqCst),
+            1,
+            "the server-side write completed after the client timed out"
+        );
+        let after_quarantine = ConfigSyncStore::claim_due_jobs(&store, "worker-new", 211, 100, 1)
+            .await
+            .unwrap();
+        assert_eq!(after_quarantine.len(), 1);
+        assert_eq!(after_quarantine[0].generation, 2);
+
+        server.abort();
+        std::fs::remove_file(db_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn startup_preflight_rejects_poisoned_legacy_route_configuration() {
+        let db_path = std::env::temp_dir().join(format!(
+            "sag-control-plane-legacy-route-preflight-{}-{}.db",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let store = StorageStore::Sqlite(shared_storage::SqliteStore::new(
+            db_path.to_string_lossy().to_string(),
+        ));
+        ensure_store_schema(&store).await.unwrap();
+        RoutesStore::upsert(
+            &store,
+            &TunnelRouteRecord {
+                host: "legacy.internal".into(),
+                app_id: "app-legacy".into(),
+                connector_endpoint: "connector-legacy:stream".into(),
+                require_healthy_tunnel: true,
+            },
+        )
+        .await
+        .unwrap();
+        // This low-level insert models a row persisted by an older binary,
+        // before online mutation validation existed.
+        RoutesStore::upsert_intranet_upstream(
+            &store,
+            &IntranetUpstreamRecord {
+                app_id: "app-legacy".into(),
+                upstream: "bad!host:8080".into(),
+                scheme: "http".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let error = validate_persisted_route_configuration(&store)
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("persisted route configuration is unsafe"));
+
+        std::fs::remove_file(db_path).unwrap();
+    }
 }

@@ -2,7 +2,9 @@
 
 ## Status
 
-Proposed on 2026-07-26. Awaiting approval.
+Accepted and implemented in the current source tree. Production fault-matrix
+evidence remains a release gate; this status records the implemented protocol
+and state-machine decision, not an unverified deployment claim.
 
 ## Context
 
@@ -66,4 +68,3 @@ not transparent cross-stream replay.
 - `docs/plans/2026-07-26-stream-epoch-request-state-design.md`
 - `docs/plans/2026-07-26-request-deadline-cancellation-design.md`
 - `docs/plans/2026-07-26-connector-postgres-decoupling-revision-design.md`
-

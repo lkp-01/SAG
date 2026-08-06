@@ -2,6 +2,13 @@
 
 Schema is owned by `shared_storage` (`tunnel_routes`, `intranet_upstreams`, `policies`). Prefer letting **control-plane-admin** create tables by starting it once.
 
+For a running stack, always prefer the management API scripts. The tracked raw
+SQL files must be executed as complete files while **all control-plane-admin
+replicas are stopped**; they now advance `config_state.generation`, write audit
+records, and enqueue APISIX work in the same transaction. Never copy only their
+`INSERT INTO tunnel_routes` / `intranet_upstreams` statements, because that
+would create a same-generation snapshot conflict at every running Agent.
+
 Default DB path for admin + policy (when `SAG_STORAGE_DB_PATH` is unset): **`sag-cloud/data/sag-storage/sag.db`** relative to process cwd.
 
 ## Demo tunnel route (smoke / default connector)

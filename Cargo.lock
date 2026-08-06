@@ -361,6 +361,7 @@ dependencies = [
  "sag-service-health",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "shared_storage",
  "tokio",
  "tokio-postgres",
